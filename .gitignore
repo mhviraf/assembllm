@@ -1,0 +1,17 @@
+# model weights and data (download with the commands in gpt2asm/README.md)
+*.bin
+# build outputs
+gpt2asm/gpt2
+gpt2asm/*.o
+gpt2asm/test_vs_llmc
+gpt2asm/gen_ref
+gpt2asm/bench
+gpt2asm/bench_omp
+gpt2asm/out_*.txt
+gpt2asm/bench_results.txt
+# llm.c checkout used by the tests, and leftovers
+llm.c/
+gpt2asm/llm.c/
+gpt2asm/_to_delete/
+llmc_gpt2_arm64.zip
+.DS_Store
