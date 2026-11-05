@@ -19,6 +19,12 @@ float a_random_f32(uint64_t*);
 int a_sample_mult(const float*, int, float);
 void a_pack_weights(float*, const float*, long, long);
 void a_matmul_packed(float*, const float*, const float*, const float*, long, long, long, long);
+void a_pack_f16(void*, const float*, long, long);
+void a_f32_to_f16(void*, const float*, long);
+void a_matmul_f16(float*, const void*, const void*, const float*, long, long, long, long);
+void a_qpack_w(void*, const float*, long, long, const float*);
+void a_quant_rows(void*, float*, const float*, long, long, const float*);
+void a_matmul_q8_test(float*, const void*, const void*, const float*, long, long, long, long, float*);
 
 // llm.c's sampler (verbatim), which train_gpt2.c compiles out under TESTING
 unsigned int random_u32(uint64_t *state) {
@@ -80,12 +86,48 @@ static void test_kernels(void) {
         int N = pk[s][0], C = pk[s][1], OC = pk[s][2];
         for (int wb = 0; wb < 2; wb++) {
             float *inp = rnd(N*C, 1), *w = rnd(OC*C, 1), *b = wb ? rnd(OC, 1) : NULL, *wp = zeros(OC*C);
-            float *o1 = zeros(N*OC), *o2 = zeros(N*OC);
+            float *o1 = zeros(N*OC), *o2 = rnd(N*OC, 100);   // garbage: every output must be written
             a_pack_weights(wp, w, OC, C);
             matmul_forward(o1, inp, w, b, 1, N, C, OC);
             a_matmul_packed(o2, inp, wp, b, N, C, OC, OC);
             char nm[64]; snprintf(nm, 64, "packed matmul N=%d C=%d OC=%d bias=%d", N, C, OC, wb);
             check(nm, o2, o1, N*OC, 1e-5);
+        }
+    }
+    // fp16 5x32 matmul: fp16 inputs/weights, fp16 sums folded into fp32 every 128 k.
+    // Not exact: checked against a relative error budget instead.
+    int ph[][3] = {{64,768,64},{13,64,64},{1,8,32},{9,16,32},{8,3072,32},{63,768,96},{5,256,32},{7,200,32}};
+    for (int s = 0; s < 8; s++) {
+        int N = ph[s][0], C = ph[s][1], OC = ph[s][2];
+        for (int wb = 0; wb < 2; wb++) {
+            float *inp = rnd(N*C, 1), *w = rnd(OC*C, 1), *b = wb ? rnd(OC, 1) : NULL;
+            void *wp = malloc((size_t)OC*C*2), *x16 = malloc((size_t)N*C*2);
+            float *o1 = zeros(N*OC), *o2 = rnd(N*OC, 100);   // garbage: every output must be written
+            a_pack_f16(wp, w, OC, C);
+            a_f32_to_f16(x16, inp, N*C);
+            matmul_forward(o1, inp, w, b, 1, N, C, OC);
+            a_matmul_f16(o2, x16, wp, b, N, C, OC, OC);
+            char nm[64]; snprintf(nm, 64, "fp16 matmul N=%d C=%d OC=%d bias=%d", N, C, OC, wb);
+            check(nm, o2, o1, N*OC, 5e-3);
+        }
+    }
+    // int8 5x16 matmul: per-channel int8 weights, per-row int8 inputs, int32 sums
+    int pq[][3] = {{64,768,64},{13,64,48},{1,16,16},{9,32,32},{8,3072,16},{63,768,96},{5,256,32}};
+    for (int s = 0; s < 7; s++) {
+        int N = pq[s][0], C = pq[s][1], OC = pq[s][2];
+        for (int wb = 0; wb < 2; wb++) {
+            float *inp = rnd(N*C, 1), *w = rnd(OC*C, 1), *b = wb ? rnd(OC, 1) : NULL;
+            void *wq = malloc((size_t)OC*C + 4*OC), *xq = malloc((size_t)N*C);
+            float *xs = zeros(N + 8), *o1 = zeros(N*OC), *o2 = rnd(N*OC, 100);
+            // smoothing: activations * m, weights * (1/m) leaves the product unchanged
+            float *m = rnd(C, 1), *im = zeros(C);
+            for (int k = 0; k < C; k++) { m[k] = (float)(1 << (k % 3)) * 0.5f; im[k] = 1.0f / m[k]; }   // 0.5, 1, 2: exact
+            if (s % 2) { a_qpack_w(wq, w, OC, C, im); a_quant_rows(xq, xs, inp, N, C, m); }
+            else { a_qpack_w(wq, w, OC, C, NULL); a_quant_rows(xq, xs, inp, N, C, NULL); }
+            matmul_forward(o1, inp, w, b, 1, N, C, OC);
+            a_matmul_q8_test(o2, xq, wq, b, N, C, OC, OC, xs);
+            char nm[64]; snprintf(nm, 64, "int8 matmul N=%d C=%d OC=%d bias=%d", N, C, OC, wb);
+            check(nm, o2, o1, N*OC, 2e-2);
         }
     }
     // layernorm

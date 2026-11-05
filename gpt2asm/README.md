@@ -9,6 +9,7 @@ git clone https://github.com/karpathy/llm.c
 (cd llm.c && ./dev/download_starter_pack.sh)   # gpt2_124M.bin + gpt2_tokenizer.bin
 make
 ./gpt2 llm.c/gpt2_124M.bin llm.c/gpt2_tokenizer.bin 64
+GPT2A_PRECISION=fp16 ./gpt2 llm.c/gpt2_124M.bin llm.c/gpt2_tokenizer.bin 64
 ```
 
 The same source also builds on aarch64 Linux.
@@ -18,7 +19,10 @@ The same source also builds on aarch64 Linux.
 - **Kernels:** encoder, layernorm, matmul (weights repacked at load time into 16-channel panels, 5×16 NEON register tiles), causal attention, GELU, residual and softmax. `exp` and `tanh` are vectorized and hand-written.
 - **Program:** checkpoint loader, decode-only tokenizer, xorshift sampler and the generation loop.
 - **Threads:** a small pthreads pool splits the matmuls, attention, GELU and softmax across cores. Set `GPT2A_THREADS=n`; the default is all CPUs.
-- **libc use:** limited to file I/O, `malloc`/`free`, `printf`/`putchar` and `pthread_create`/`pthread_join`.
+- **Precision:** set `GPT2A_PRECISION` to `fp32` (the default, matches llm.c), `fp16` (2× the math per instruction, practically lossless) or `int8` (4×).
+  - For int8, also set `GPT2A_CALIB=<llm.c token file>` so it can calibrate (SmoothQuant). Without that, int8 is much less accurate.
+  - `GPT2A_SQ_ALPHA=25|50|75` sets the SmoothQuant balance; the default is 25.
+- **libc use:** limited to file I/O, `malloc`/`free`, `printf`/`putchar`, `getenv`/`atoi`/`sysconf` and `pthread_create`/`pthread_join`.
 
 ## Check it against llm.c
 

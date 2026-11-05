@@ -18,6 +18,21 @@
 // sums, and enough independent accumulators to keep all 4 FMA pipes busy.
 // Shapes that do not allow packing use the 4x4 dot-product kernel.
 //
+// GPT2A_PRECISION=fp16: weights are stored as fp16 in 32-channel panels and each
+// matmul input is converted to fp16. The kernel computes 5 rows x 32 channels with
+// 20 fp16 accumulators (2x the multiply-adds of fp32 per instruction) and folds
+// them into fp32 outputs every 64 k, so the long sums still happen in fp32.
+//
+// GPT2A_PRECISION=int8: weights are int8 with one scale per output channel, and
+// each matmul input is quantized to int8 with one scale per row. sdot adds 16
+// int8 products per instruction into exact int32 sums (4x fp32's multiply-adds);
+// the only error is the int8 rounding of weights and inputs.
+// With GPT2A_CALIB=<llm.c token file>, int8 is calibrated SmoothQuant-style: a
+// few fp32 forward passes record each input channel's max |x|, then channel k is
+// divided by s_k = max|x_k|^a / max|W_k|^(1-a) in the activations and multiplied
+// by s_k in the weights, moving GPT-2's outlier channels into the weights.
+// a = 0.25 by default (best for GPT-2 124M); GPT2A_SQ_ALPHA=50 or 75 for 0.5, 0.75.
+//
 // Threads: the matmuls, attention, GELU and softmax are split across a small
 // thread pool (GPT2A_THREADS=n, default: all CPUs). Workers are started at the
 // beginning of each forward pass and joined at the end, so nothing spins between
@@ -27,6 +42,10 @@
 // Calling convention: standard AAPCS64. x18 is never touched (reserved on
 // Apple). Varargs for printf go through helpers that put the arguments both
 // in registers (Linux) and on the stack (Apple), so one source serves both.
+
+// fp16 vector arithmetic (FEAT_FP16) and int8 dot products are used by the
+// reduced-precision kernels; every Apple silicon core has both.
+    .arch   armv8.2-a+fp16+dotprod
 
 #if defined(__APPLE__)
 #define SYM(x) _##x
@@ -192,6 +211,169 @@
     FMA5x16 3
 .endm
 
+// fp16 5x32 kernel: one k of 5 rows (inputs v0-v4, lane i) times 32 channels (v8-v11)
+.macro FMA5x32 i
+    fmla    v12.8h, v8.8h, v0.h[\i]
+    fmla    v13.8h, v9.8h, v0.h[\i]
+    fmla    v14.8h, v10.8h, v0.h[\i]
+    fmla    v15.8h, v11.8h, v0.h[\i]
+    fmla    v16.8h, v8.8h, v1.h[\i]
+    fmla    v17.8h, v9.8h, v1.h[\i]
+    fmla    v18.8h, v10.8h, v1.h[\i]
+    fmla    v19.8h, v11.8h, v1.h[\i]
+    fmla    v20.8h, v8.8h, v2.h[\i]
+    fmla    v21.8h, v9.8h, v2.h[\i]
+    fmla    v22.8h, v10.8h, v2.h[\i]
+    fmla    v23.8h, v11.8h, v2.h[\i]
+    fmla    v24.8h, v8.8h, v3.h[\i]
+    fmla    v25.8h, v9.8h, v3.h[\i]
+    fmla    v26.8h, v10.8h, v3.h[\i]
+    fmla    v27.8h, v11.8h, v3.h[\i]
+    fmla    v28.8h, v8.8h, v4.h[\i]
+    fmla    v29.8h, v9.8h, v4.h[\i]
+    fmla    v30.8h, v10.8h, v4.h[\i]
+    fmla    v31.8h, v11.8h, v4.h[\i]
+.endm
+.macro W32
+    ld1     {v8.8h, v9.8h, v10.8h, v11.8h}, [x8], #64
+.endm
+// eight k steps: 5 input vectors (8 k each) and 8 x 32 packed fp16 weights
+.macro KSTEP16
+    ld1     {v0.8h}, [x0], #16
+    ld1     {v1.8h}, [x1], #16
+    ld1     {v2.8h}, [x2], #16
+    ld1     {v3.8h}, [x3], #16
+    ld1     {v4.8h}, [x4], #16
+    W32
+    FMA5x32 0
+    W32
+    FMA5x32 1
+    W32
+    FMA5x32 2
+    W32
+    FMA5x32 3
+    W32
+    FMA5x32 4
+    W32
+    FMA5x32 5
+    W32
+    FMA5x32 6
+    W32
+    FMA5x32 7
+.endm
+// add 4 fp16 accumulators (32 channels) into the fp32 output row at x9
+.macro FOLD32 a, b, c, d
+    fcvtl   v0.4s, \a\().4h
+    fcvtl2  v1.4s, \a\().8h
+    fcvtl   v2.4s, \b\().4h
+    fcvtl2  v3.4s, \b\().8h
+    ld1     {v8.4s, v9.4s, v10.4s, v11.4s}, [x9]
+    fadd    v8.4s, v8.4s, v0.4s
+    fadd    v9.4s, v9.4s, v1.4s
+    fadd    v10.4s, v10.4s, v2.4s
+    fadd    v11.4s, v11.4s, v3.4s
+    st1     {v8.4s, v9.4s, v10.4s, v11.4s}, [x9], #64
+    fcvtl   v0.4s, \c\().4h
+    fcvtl2  v1.4s, \c\().8h
+    fcvtl   v2.4s, \d\().4h
+    fcvtl2  v3.4s, \d\().8h
+    ld1     {v8.4s, v9.4s, v10.4s, v11.4s}, [x9]
+    fadd    v8.4s, v8.4s, v0.4s
+    fadd    v9.4s, v9.4s, v1.4s
+    fadd    v10.4s, v10.4s, v2.4s
+    fadd    v11.4s, v11.4s, v3.4s
+    st1     {v8.4s, v9.4s, v10.4s, v11.4s}, [x9]
+.endm
+
+// int8 5x16 kernel: one group of 4 k (lane g of inputs v0-v4) times 16 channels (v8-v11)
+.macro SDOT20 g
+    sdot    v12.4s, v8.16b, v0.4b[\g]
+    sdot    v13.4s, v9.16b, v0.4b[\g]
+    sdot    v14.4s, v10.16b, v0.4b[\g]
+    sdot    v15.4s, v11.16b, v0.4b[\g]
+    sdot    v16.4s, v8.16b, v1.4b[\g]
+    sdot    v17.4s, v9.16b, v1.4b[\g]
+    sdot    v18.4s, v10.16b, v1.4b[\g]
+    sdot    v19.4s, v11.16b, v1.4b[\g]
+    sdot    v20.4s, v8.16b, v2.4b[\g]
+    sdot    v21.4s, v9.16b, v2.4b[\g]
+    sdot    v22.4s, v10.16b, v2.4b[\g]
+    sdot    v23.4s, v11.16b, v2.4b[\g]
+    sdot    v24.4s, v8.16b, v3.4b[\g]
+    sdot    v25.4s, v9.16b, v3.4b[\g]
+    sdot    v26.4s, v10.16b, v3.4b[\g]
+    sdot    v27.4s, v11.16b, v3.4b[\g]
+    sdot    v28.4s, v8.16b, v4.4b[\g]
+    sdot    v29.4s, v9.16b, v4.4b[\g]
+    sdot    v30.4s, v10.16b, v4.4b[\g]
+    sdot    v31.4s, v11.16b, v4.4b[\g]
+.endm
+// sixteen k: 5 input vectors (16 int8 k each), 4 x (16 channels x 4 k) weights
+.macro KSTEPQ
+    ld1     {v0.16b}, [x0], #16
+    ld1     {v1.16b}, [x1], #16
+    ld1     {v2.16b}, [x2], #16
+    ld1     {v3.16b}, [x3], #16
+    ld1     {v4.16b}, [x4], #16
+    ld1     {v8.16b, v9.16b, v10.16b, v11.16b}, [x8], #64
+    SDOT20  0
+    ld1     {v8.16b, v9.16b, v10.16b, v11.16b}, [x8], #64
+    SDOT20  1
+    ld1     {v8.16b, v9.16b, v10.16b, v11.16b}, [x8], #64
+    SDOT20  2
+    ld1     {v8.16b, v9.16b, v10.16b, v11.16b}, [x8], #64
+    SDOT20  3
+.endm
+// int32 sums -> float, times the 16 channel scales (v8-v11) and the row scale
+.macro DEQ a, b, c, d, rs
+    scvtf   \a\().4s, \a\().4s
+    scvtf   \b\().4s, \b\().4s
+    scvtf   \c\().4s, \c\().4s
+    scvtf   \d\().4s, \d\().4s
+    fmul    \a\().4s, \a\().4s, v8.4s
+    fmul    \b\().4s, \b\().4s, v9.4s
+    fmul    \c\().4s, \c\().4s, v10.4s
+    fmul    \d\().4s, \d\().4s, v11.4s
+    fmul    \a\().4s, \a\().4s, \rs
+    fmul    \b\().4s, \b\().4s, \rs
+    fmul    \c\().4s, \c\().4s, \rs
+    fmul    \d\().4s, \d\().4s, \rs
+.endm
+.macro BIAS16 a, b, c, d
+    fadd    \a\().4s, \a\().4s, v0.4s
+    fadd    \b\().4s, \b\().4s, v1.4s
+    fadd    \c\().4s, \c\().4s, v2.4s
+    fadd    \d\().4s, \d\().4s, v3.4s
+.endm
+
+// MMHOOK inp, rows, channels, stats_offset: before a matmul in the forward pass.
+// While calibrating, records max |x| per input channel. After calibration (int8),
+// sets x7 = this matmul's 1/s for the quantizer; otherwise x7 = 0. Uses x11, x12.
+.macro MMHOOK inpreg, nreg, kreg, offreg
+    mov     x7, #0
+    ldr     x11, [x28, #G_STATS]
+    cbz     x11, 98f
+    add     x11, x11, \offreg, lsl #2
+    ldr     x12, [x28, #G_CALIB]
+    cbz     x12, 97f
+    stp     x0, x1, [sp, #-64]!
+    stp     x2, x3, [sp, #16]
+    stp     x4, x5, [sp, #32]
+    str     x6, [sp, #48]
+    mov     x0, x11
+    mov     x1, \inpreg
+    mov     x2, \nreg
+    mov     x3, \kreg
+    bl      SYM(a_colmax)
+    ldp     x2, x3, [sp, #16]
+    ldp     x4, x5, [sp, #32]
+    ldr     x6, [sp, #48]
+    ldp     x0, x1, [sp], #64
+    b       98f
+97: mov     x7, x11
+98:
+.endm
+
 // float constants (bit patterns)
 .equ F_NEG10000,   0xC61C4000      // -10000.0f, initial max in llm.c
 .equ F_EPS,        0x3727C5AC      // 1e-5f, layernorm epsilon
@@ -237,7 +419,15 @@
 .equ G_TIDS,        1744     // pthread_t of each worker (64 x 8 bytes)
 .equ G_PACKED,      2304     // 1 when matmul weights are repacked for the 5x16 kernel
 .equ G_WTE_PACKED,  2312     // packed copy of wte for the logits matmul
-.equ G_SIZE,        2368
+.equ G_ACT_H16,     2320     // fp16 copy of the current matmul input (N x 4C)
+.equ G_ACT_Q8,      2328     // int8 copy of the current matmul input (N x 4C)
+.equ G_ACT_XS,      2336     // its per-row scales (N + 8 floats)
+.equ G_CALIB,       2344     // 1 while calibrating: record matmul input channel maxima
+.equ G_STATS,       2352     // per-layer [C | C | C | 4C] + final [C]: max |x| (then 1/s)
+.equ G_SCALES,      2360     // same layout: s (applied to the weights)
+.equ G_ALPHA,       2368     // SmoothQuant alpha x 100: 25 (default), 50 or 75
+.equ G_SIZE,        2432
+.equ KC16,          64       // fp16 accumulation block before folding into fp32
 .equ MAX_THREADS,   64
 
 // parameter tensor slots (offsets into G_PARAMS), llm.c order
@@ -310,6 +500,14 @@ s_err_tok:       .asciz "Error: input token out of range [0, vocab_size)\n"
 s_warn_tok:      .asciz "WARNING: could not open tokenizer file %s, printing token ids instead\n"
 s_invalid_tok:   .asciz "invalid token id %ld!\n"
 s_env_threads:   .asciz "GPT2A_THREADS"
+s_env_prec:      .asciz "GPT2A_PRECISION"
+s_env_calib:     .asciz "GPT2A_CALIB"
+s_env_alpha:     .asciz "GPT2A_SQ_ALPHA"
+s_calib:         .asciz "calibrating int8 (SmoothQuant) on %ld tokens\n"
+s_nocalib:       .asciz "note: int8 without GPT2A_CALIB=<token file> is uncalibrated and much less accurate\n"
+s_err_data:      .asciz "Error: bad calibration token file\n"
+s_prec16:        .asciz "precision: fp16 weights and matmul inputs, fp32 sums\n"
+s_prec8:         .asciz "precision: int8 weights (per channel) and matmul inputs (per row), int32 sums\n"
 s_threads:       .asciz "threads: %ld\n"
 s_err_thread:    .asciz "Error: pthread_create failed\n"
 
@@ -1385,6 +1583,978 @@ pk_done:
     ret
 
 // ===========================================================================
+// fp16 matmul
+
+// void a_pack_f16(uint16_t* dst, const float* src, long OC, long C)
+// dst[(q*C + k)*32 + j] = fp16(src[(q*32 + j)*C + k])   (OC % 32 == 0)
+FUNC SYM(a_pack_f16)
+    lsl     x9, x3, #2                  // row bytes
+    lsl     x10, x9, #5                 // 32 rows
+    mov     x11, #0
+1:  cmp     x11, x2
+    b.ge    9f
+    mov     x12, x1
+    mov     x13, x3
+2:  mov     x14, x12
+    mov     x15, #32
+3:  ldr     s0, [x14]
+    fcvt    h0, s0
+    str     h0, [x0], #2
+    add     x14, x14, x9
+    subs    x15, x15, #1
+    b.gt    3b
+    add     x12, x12, #4
+    subs    x13, x13, #1
+    b.gt    2b
+    add     x1, x1, x10
+    add     x11, x11, #32
+    b       1b
+9:  ret
+
+// void a_f32_to_f16(uint16_t* dst, const float* src, long n)
+FUNC SYM(a_f32_to_f16)
+1:  cmp     x2, #16
+    b.lt    2f
+    ld1     {v0.4s, v1.4s, v2.4s, v3.4s}, [x1], #64
+    fcvtn   v4.4h, v0.4s
+    fcvtn2  v4.8h, v1.4s
+    fcvtn   v5.4h, v2.4s
+    fcvtn2  v5.8h, v3.4s
+    st1     {v4.8h, v5.8h}, [x0], #32
+    sub     x2, x2, #16
+    b       1b
+2:  cbz     x2, 3f
+    ldr     s0, [x1], #4
+    fcvt    h0, s0
+    str     h0, [x0], #2
+    sub     x2, x2, #1
+    b       2b
+3:  ret
+
+// void a_matmul_f16(float* out, const uint16_t* inp, const uint16_t* wp,
+//                   const float* bias, long N, long C, long OC, long ldo)
+// inp: N x C fp16. wp: packed by a_pack_f16. Needs C % 8 == 0, OC % 32 == 0.
+// Tiles of 5 rows x 32 channels; fp16 sums over blocks of KC16 k are folded
+// into the fp32 output, which starts as the bias.
+FUNC SYM(a_matmul_f16)
+    stp     x29, x30, [sp, #-160]!
+    mov     x29, sp
+    SAVE_X19_X28
+    stp     d8, d9, [sp, #96]
+    stp     d10, d11, [sp, #112]
+    stp     d12, d13, [sp, #128]
+    stp     d14, d15, [sp, #144]
+    mov     x19, x0                     // out
+    mov     x20, x1                     // inp (fp16)
+    mov     x21, x2                     // packed fp16 weights
+    mov     x22, x3                     // bias
+    mov     x23, x4                     // N
+    mov     x24, x5                     // C
+    mov     x25, x6                     // OC
+    lsl     x26, x7, #2                 // output row bytes
+    lsl     x12, x24, #1                // input row bytes
+    lsl     x13, x24, #6                // panel bytes (C x 32 halves)
+    sub     x16, x23, #1                // last row
+    mov     x15, x21                    // current panel
+    mov     x28, #0                     // o
+h_panel:
+    cmp     x28, x25
+    b.ge    h_done
+    mov     x27, #0                     // r
+h_rblk:
+    cmp     x27, x23
+    b.ge    h_next
+    madd    x0, x27, x12, x20
+    add     x9, x27, #1
+    cmp     x9, x16
+    csel    x9, x16, x9, gt
+    madd    x1, x9, x12, x20
+    add     x9, x27, #2
+    cmp     x9, x16
+    csel    x9, x16, x9, gt
+    madd    x2, x9, x12, x20
+    add     x9, x27, #3
+    cmp     x9, x16
+    csel    x9, x16, x9, gt
+    madd    x3, x9, x12, x20
+    add     x9, x27, #4
+    cmp     x9, x16
+    csel    x9, x16, x9, gt
+    madd    x4, x9, x12, x20
+    mov     x8, x15
+    sub     x5, x23, x27                // rows left (>= 1)
+    mul     x7, x27, x26
+    add     x7, x7, x28, lsl #2
+    add     x7, x19, x7                 // output tile
+    // output rows start as the bias (or zero)
+    movi    v0.16b, #0
+    movi    v1.16b, #0
+    movi    v2.16b, #0
+    movi    v3.16b, #0
+    movi    v4.16b, #0
+    movi    v5.16b, #0
+    movi    v6.16b, #0
+    movi    v7.16b, #0
+    cbz     x22, 1f
+    add     x9, x22, x28, lsl #2
+    ld1     {v0.4s, v1.4s, v2.4s, v3.4s}, [x9], #64
+    ld1     {v4.4s, v5.4s, v6.4s, v7.4s}, [x9]
+1:  mov     x9, x7
+    mov     x10, #5                     // rows in this block: min(5, rows left)
+    cmp     x5, x10
+    csel    x10, x5, x10, lt
+2:  st1     {v0.4s, v1.4s, v2.4s, v3.4s}, [x9]
+    add     x11, x9, #64
+    st1     {v4.4s, v5.4s, v6.4s, v7.4s}, [x11]
+    add     x9, x9, x26
+    subs    x10, x10, #1
+    b.gt    2b
+3:  mov     x6, x24                     // k left
+h_chunk:
+    movi    v12.16b, #0
+    movi    v13.16b, #0
+    movi    v14.16b, #0
+    movi    v15.16b, #0
+    movi    v16.16b, #0
+    movi    v17.16b, #0
+    movi    v18.16b, #0
+    movi    v19.16b, #0
+    movi    v20.16b, #0
+    movi    v21.16b, #0
+    movi    v22.16b, #0
+    movi    v23.16b, #0
+    movi    v24.16b, #0
+    movi    v25.16b, #0
+    movi    v26.16b, #0
+    movi    v27.16b, #0
+    movi    v28.16b, #0
+    movi    v29.16b, #0
+    movi    v30.16b, #0
+    movi    v31.16b, #0
+    mov     x9, #KC16
+    cmp     x6, x9
+    csel    x9, x6, x9, lt              // k in this block
+    sub     x6, x6, x9
+    cbnz    x27, 5f
+4:  add     x11, x8, x13                // first row block: fetch the next panel
+    prfm    pldl2keep, [x11]
+    prfm    pldl2keep, [x11, #64]
+    prfm    pldl2keep, [x11, #128]
+    prfm    pldl2keep, [x11, #192]
+    prfm    pldl2keep, [x11, #256]
+    prfm    pldl2keep, [x11, #320]
+    prfm    pldl2keep, [x11, #384]
+    prfm    pldl2keep, [x11, #448]
+    KSTEP16
+    subs    x9, x9, #8
+    b.gt    4b
+    b       6f
+5:  KSTEP16
+    subs    x9, x9, #8
+    b.gt    5b
+6:  // fold the fp16 block sums into the fp32 output rows
+    mov     x9, x7
+    FOLD32  v12, v13, v14, v15
+    cmp     x5, #1
+    b.le    7f
+    add     x9, x7, x26
+    FOLD32  v16, v17, v18, v19
+    cmp     x5, #2
+    b.le    7f
+    add     x9, x7, x26, lsl #1
+    FOLD32  v20, v21, v22, v23
+    cmp     x5, #3
+    b.le    7f
+    add     x9, x7, x26, lsl #1
+    add     x9, x9, x26
+    FOLD32  v24, v25, v26, v27
+    cmp     x5, #4
+    b.le    7f
+    add     x9, x7, x26, lsl #2
+    FOLD32  v28, v29, v30, v31
+7:  cbnz    x6, h_chunk
+    add     x27, x27, #5
+    b       h_rblk
+h_next:
+    add     x15, x15, x13
+    add     x28, x28, #32
+    b       h_panel
+h_done:
+    ldp     d8, d9, [sp, #96]
+    ldp     d10, d11, [sp, #112]
+    ldp     d12, d13, [sp, #128]
+    ldp     d14, d15, [sp, #144]
+    RESTORE_X19_X28
+    ldp     x29, x30, [sp], #160
+    ret
+
+// pack16_inplace(float* w, long OC, long C, void* tmp): fp16 panels written over w
+    .p2align 4
+pack16_inplace:
+    stp     x29, x30, [sp, #-48]!
+    mov     x29, sp
+    stp     x19, x20, [sp, #16]
+    str     x21, [sp, #32]
+    mov     x19, x0
+    mul     x20, x1, x2
+    mov     x21, x3
+    mov     x9, x1
+    mov     x10, x2
+    mov     x0, x21
+    mov     x1, x19
+    mov     x2, x9
+    mov     x3, x10
+    bl      SYM(a_pack_f16)
+    mov     x0, x19                     // copy n/2 floats' worth of bytes (n halves)
+    mov     x1, x21
+    lsr     x2, x20, #1
+    bl      copy_f32
+    ldp     x19, x20, [sp, #16]
+    ldr     x21, [sp, #32]
+    ldp     x29, x30, [sp], #48
+    ret
+
+// pack16_all: fp16-pack every matmul weight in place, fp16 copy of wte, fp16 input buffer
+    .p2align 4
+pack16_all:
+    stp     x29, x30, [sp, #-96]!
+    mov     x29, sp
+    SAVE_X19_X28
+    LOADADDR x19, G
+    ldr     x20, [x19, #G_C]
+    ldr     x21, [x19, #G_L]
+    mul     x0, x20, x20
+    lsl     x0, x0, #3                  // scratch: 4C*C halves
+    bl      xmalloc
+    mov     x22, x0
+    add     x24, x20, x20, lsl #1       // 3C
+    lsl     x25, x20, #2                // 4C
+    mov     x23, #0
+1:  cmp     x23, x21
+    b.ge    2f
+    mul     x9, x23, x24
+    mul     x9, x9, x20
+    ldr     x0, [x19, #P_QKVW]
+    add     x0, x0, x9, lsl #2
+    mov     x1, x24
+    mov     x2, x20
+    mov     x3, x22
+    bl      pack16_inplace
+    mul     x9, x23, x20
+    mul     x9, x9, x20
+    ldr     x0, [x19, #P_ATTPROJW]
+    add     x0, x0, x9, lsl #2
+    mov     x1, x20
+    mov     x2, x20
+    mov     x3, x22
+    bl      pack16_inplace
+    mul     x9, x23, x25
+    mul     x9, x9, x20
+    ldr     x0, [x19, #P_FCW]
+    add     x0, x0, x9, lsl #2
+    mov     x1, x25
+    mov     x2, x20
+    mov     x3, x22
+    bl      pack16_inplace
+    mul     x9, x23, x25
+    mul     x9, x9, x20
+    ldr     x0, [x19, #P_FCPROJW]
+    add     x0, x0, x9, lsl #2
+    mov     x1, x20
+    mov     x2, x25
+    mov     x3, x22
+    bl      pack16_inplace
+    add     x23, x23, #1
+    b       1b
+2:  mov     x0, x22
+    bl      SYM(free)
+    ldr     x9, [x19, #G_VP]
+    mul     x0, x9, x20
+    lsl     x0, x0, #1
+    bl      xmalloc
+    str     x0, [x19, #G_WTE_PACKED]
+    ldr     x1, [x19, #P_WTE]
+    ldr     x2, [x19, #G_VP]
+    mov     x3, x20
+    bl      SYM(a_pack_f16)
+    mov     x9, #2
+    str     x9, [x19, #G_PACKED]
+    LOADADDR x0, s_prec16
+    bl      pr0
+    RESTORE_X19_X28
+    ldp     x29, x30, [sp], #96
+    ret
+
+// ===========================================================================
+// int8 matmul
+
+// void a_qpack_w(int8_t* dst, const float* src, long OC, long C, const float* colscale)
+// Per panel of 16 channels: 16 float scales (max|row| / 127), then for each group
+// of 4 k, 16 channels x 4 int8. W[o][k] is multiplied by colscale[k] first (if given).
+// Needs OC % 16 == 0, C % 4 == 0.
+FUNC SYM(a_qpack_w)
+    lsl     x9, x3, #2                  // row bytes
+    mov     x10, #0                     // first channel of the panel
+    MOV32   w15, 0x42FE0000             // 127.0f
+    fmov    s7, w15
+1:  cmp     x10, x2
+    b.ge    9f
+    mul     x11, x10, x9
+    add     x11, x1, x11                // row 0 of this panel
+    mov     x12, #0
+2:  madd    x13, x12, x9, x11           // scales: max |W[o][k] * colscale[k]| / 127
+    movi    d0, #0
+    mov     x14, #0
+3:  ldr     s1, [x13, x14, lsl #2]
+    cbz     x4, 31f
+    ldr     s5, [x4, x14, lsl #2]
+    fmul    s1, s1, s5
+31: fabs    s1, s1
+    fmax    s0, s0, s1
+    add     x14, x14, #1
+    cmp     x14, x3
+    b.lt    3b
+    fdiv    s2, s0, s7
+    fcmp    s0, #0.0
+    b.ne    4f
+    fmov    s2, #1.0
+4:  str     s2, [x0], #4
+    add     x12, x12, #1
+    cmp     x12, #16
+    b.lt    2b
+    sub     x16, x0, #64                // the 16 scales just written
+    mov     x12, #0                     // k group start
+5:  cmp     x12, x3
+    b.ge    8f
+    mov     x13, #0                     // channel j
+6:  madd    x14, x13, x9, x11
+    ldr     s3, [x16, x13, lsl #2]
+    mov     x15, #0
+7:  add     x5, x12, x15
+    ldr     s1, [x14, x5, lsl #2]
+    cbz     x4, 71f
+    ldr     s5, [x4, x5, lsl #2]
+    fmul    s1, s1, s5
+71: fdiv    s1, s1, s3
+    fcvtns  w17, s1
+    mov     w6, #127
+    cmp     w17, w6
+    csel    w17, w6, w17, gt
+    mov     w6, #-127
+    cmp     w17, w6
+    csel    w17, w6, w17, lt
+    strb    w17, [x0], #1
+    add     x15, x15, #1
+    cmp     x15, #4
+    b.lt    7b
+    add     x13, x13, #1
+    cmp     x13, #16
+    b.lt    6b
+    add     x12, x12, #4
+    b       5b
+8:  add     x10, x10, #16
+    b       1b
+9:  ret
+
+// void a_quant_rows(int8_t* q, float* scales, const float* x, long N, long C,
+//                   const float* chanmul)
+// Per row: y = x * chanmul (if given), scale = max|y| / 127, q = round(y / scale).
+// Needs C % 16 == 0.
+FUNC SYM(a_quant_rows)
+    MOV32   w9, 0x42FE0000              // 127.0f
+    fmov    s7, w9
+1:  cbz     x3, 9f
+    movi    v16.16b, #0
+    mov     x10, x2
+    mov     x11, x4
+    mov     x12, x5
+2:  ld1     {v0.4s, v1.4s, v2.4s, v3.4s}, [x10], #64
+    cbz     x5, 21f
+    ld1     {v20.4s, v21.4s, v22.4s, v23.4s}, [x12], #64
+    fmul    v0.4s, v0.4s, v20.4s
+    fmul    v1.4s, v1.4s, v21.4s
+    fmul    v2.4s, v2.4s, v22.4s
+    fmul    v3.4s, v3.4s, v23.4s
+21: fabs    v0.4s, v0.4s
+    fabs    v1.4s, v1.4s
+    fabs    v2.4s, v2.4s
+    fabs    v3.4s, v3.4s
+    fmax    v0.4s, v0.4s, v1.4s
+    fmax    v2.4s, v2.4s, v3.4s
+    fmax    v0.4s, v0.4s, v2.4s
+    fmax    v16.4s, v16.4s, v0.4s
+    subs    x11, x11, #16
+    b.gt    2b
+    fmaxv   s16, v16.4s
+    fdiv    s17, s16, s7                // scale
+    fdiv    s18, s7, s16                // 1 / scale
+    fcmp    s16, #0.0
+    b.ne    3f
+    fmov    s17, #1.0
+    movi    d18, #0
+3:  str     s17, [x1], #4
+    dup     v18.4s, v18.s[0]
+    mov     x11, x4
+    mov     x12, x5
+4:  ld1     {v0.4s, v1.4s, v2.4s, v3.4s}, [x2], #64
+    cbz     x5, 41f
+    ld1     {v20.4s, v21.4s, v22.4s, v23.4s}, [x12], #64
+    fmul    v0.4s, v0.4s, v20.4s
+    fmul    v1.4s, v1.4s, v21.4s
+    fmul    v2.4s, v2.4s, v22.4s
+    fmul    v3.4s, v3.4s, v23.4s
+41: fmul    v0.4s, v0.4s, v18.4s
+    fmul    v1.4s, v1.4s, v18.4s
+    fmul    v2.4s, v2.4s, v18.4s
+    fmul    v3.4s, v3.4s, v18.4s
+    fcvtns  v0.4s, v0.4s
+    fcvtns  v1.4s, v1.4s
+    fcvtns  v2.4s, v2.4s
+    fcvtns  v3.4s, v3.4s
+    sqxtn   v4.4h, v0.4s
+    sqxtn2  v4.8h, v1.4s
+    sqxtn   v5.4h, v2.4s
+    sqxtn2  v5.8h, v3.4s
+    sqxtn   v6.8b, v4.8h
+    sqxtn2  v6.16b, v5.8h
+    st1     {v6.16b}, [x0], #16
+    subs    x11, x11, #16
+    b.gt    4b
+    sub     x3, x3, #1
+    b       1b
+9:  ret
+
+// void a_colmax(float* m, const float* x, long N, long C): m[k] = max(m[k], max_r |x[r][k]|)
+FUNC SYM(a_colmax)
+1:  cbz     x2, 9f
+    mov     x9, x0
+    mov     x10, x3
+2:  cmp     x10, #4
+    b.lt    3f
+    ld1     {v0.4s}, [x1], #16
+    ld1     {v1.4s}, [x9]
+    fabs    v0.4s, v0.4s
+    fmax    v1.4s, v1.4s, v0.4s
+    st1     {v1.4s}, [x9], #16
+    sub     x10, x10, #4
+    b       2b
+3:  cbz     x10, 4f
+    ldr     s0, [x1], #4
+    ldr     s1, [x9]
+    fabs    s0, s0
+    fmax    s1, s1, s0
+    str     s1, [x9], #4
+    sub     x10, x10, #1
+    b       3b
+4:  sub     x2, x2, #1
+    b       1b
+9:  ret
+
+// void a_matmul_q8(float* out, const int8_t* xq, const int8_t* wq,
+//                  const float* bias, long N, long C, long OC, long ldo)
+// xq: N x C int8, row scales in G_ACT_XS. wq: packed by a_qpack_w.
+// Tiles of 5 rows x 16 channels with int32 sdot sums. Needs C % 16 == 0, OC % 16 == 0.
+FUNC SYM(a_matmul_q8)
+    stp     x29, x30, [sp, #-160]!
+    mov     x29, sp
+    SAVE_X19_X28
+    stp     d8, d9, [sp, #96]
+    stp     d10, d11, [sp, #112]
+    stp     d12, d13, [sp, #128]
+    stp     d14, d15, [sp, #144]
+    mov     x19, x0                     // out
+    mov     x20, x1                     // xq
+    mov     x21, x2                     // packed int8 weights
+    mov     x22, x3                     // bias
+    mov     x23, x4                     // N
+    mov     x24, x5                     // C
+    mov     x25, x6                     // OC
+    lsl     x26, x7, #2                 // output row bytes
+    mov     x12, x24                    // input row bytes
+    lsl     x13, x24, #4
+    add     x13, x13, #64               // panel bytes: 16 scales + 16 C int8
+    LOADADDR x14, G
+    ldr     x14, [x14, #G_ACT_XS]       // row scales
+    sub     x16, x23, #1                // last row
+    mov     x15, x21                    // current panel
+    mov     x28, #0                     // o
+q_panel:
+    cmp     x28, x25
+    b.ge    q_done
+    mov     x27, #0                     // r
+q_rblk:
+    cmp     x27, x23
+    b.ge    q_next
+    madd    x0, x27, x12, x20
+    add     x9, x27, #1
+    cmp     x9, x16
+    csel    x9, x16, x9, gt
+    madd    x1, x9, x12, x20
+    add     x9, x27, #2
+    cmp     x9, x16
+    csel    x9, x16, x9, gt
+    madd    x2, x9, x12, x20
+    add     x9, x27, #3
+    cmp     x9, x16
+    csel    x9, x16, x9, gt
+    madd    x3, x9, x12, x20
+    add     x9, x27, #4
+    cmp     x9, x16
+    csel    x9, x16, x9, gt
+    madd    x4, x9, x12, x20
+    add     x8, x15, #64                // past the 16 scales
+    movi    v12.16b, #0
+    movi    v13.16b, #0
+    movi    v14.16b, #0
+    movi    v15.16b, #0
+    movi    v16.16b, #0
+    movi    v17.16b, #0
+    movi    v18.16b, #0
+    movi    v19.16b, #0
+    movi    v20.16b, #0
+    movi    v21.16b, #0
+    movi    v22.16b, #0
+    movi    v23.16b, #0
+    movi    v24.16b, #0
+    movi    v25.16b, #0
+    movi    v26.16b, #0
+    movi    v27.16b, #0
+    movi    v28.16b, #0
+    movi    v29.16b, #0
+    movi    v30.16b, #0
+    movi    v31.16b, #0
+    mov     x9, x24
+    cbnz    x27, 2f
+1:  add     x11, x8, x13                // first row block: fetch the next panel
+    prfm    pldl2keep, [x11]
+    prfm    pldl2keep, [x11, #64]
+    prfm    pldl2keep, [x11, #128]
+    prfm    pldl2keep, [x11, #192]
+    KSTEPQ
+    subs    x9, x9, #16
+    b.gt    1b
+    b       3f
+2:  KSTEPQ
+    subs    x9, x9, #16
+    b.gt    2b
+3:  // scales: 16 channel scales, 5 row scales (xs has padding past N)
+    ld1     {v8.4s, v9.4s, v10.4s, v11.4s}, [x15]
+    add     x9, x14, x27, lsl #2
+    ld1     {v5.4s}, [x9], #16
+    ld1     {v6.s}[0], [x9]
+    DEQ     v12, v13, v14, v15, v5.s[0]
+    DEQ     v16, v17, v18, v19, v5.s[1]
+    DEQ     v20, v21, v22, v23, v5.s[2]
+    DEQ     v24, v25, v26, v27, v5.s[3]
+    DEQ     v28, v29, v30, v31, v6.s[0]
+    cbz     x22, 4f
+    add     x9, x22, x28, lsl #2
+    ld1     {v0.4s, v1.4s, v2.4s, v3.4s}, [x9]
+    BIAS16  v12, v13, v14, v15
+    BIAS16  v16, v17, v18, v19
+    BIAS16  v20, v21, v22, v23
+    BIAS16  v24, v25, v26, v27
+    BIAS16  v28, v29, v30, v31
+4:  sub     x10, x23, x27               // rows left (>= 1)
+    mul     x9, x27, x26
+    add     x9, x9, x28, lsl #2
+    add     x9, x19, x9
+    st1     {v12.4s, v13.4s, v14.4s, v15.4s}, [x9]
+    cmp     x10, #1
+    b.le    5f
+    add     x9, x9, x26
+    st1     {v16.4s, v17.4s, v18.4s, v19.4s}, [x9]
+    cmp     x10, #2
+    b.le    5f
+    add     x9, x9, x26
+    st1     {v20.4s, v21.4s, v22.4s, v23.4s}, [x9]
+    cmp     x10, #3
+    b.le    5f
+    add     x9, x9, x26
+    st1     {v24.4s, v25.4s, v26.4s, v27.4s}, [x9]
+    cmp     x10, #4
+    b.le    5f
+    add     x9, x9, x26
+    st1     {v28.4s, v29.4s, v30.4s, v31.4s}, [x9]
+5:  add     x27, x27, #5
+    b       q_rblk
+q_next:
+    add     x15, x15, x13
+    add     x28, x28, #16
+    b       q_panel
+q_done:
+    ldp     d8, d9, [sp, #96]
+    ldp     d10, d11, [sp, #112]
+    ldp     d12, d13, [sp, #128]
+    ldp     d14, d15, [sp, #144]
+    RESTORE_X19_X28
+    ldp     x29, x30, [sp], #160
+    ret
+
+// q8_inplace(float* w, long OC, long C, void* tmp): int8 panels written over w
+    .p2align 4
+q8_inplace:
+    stp     x29, x30, [sp, #-48]!
+    mov     x29, sp
+    stp     x19, x20, [sp, #16]
+    str     x21, [sp, #32]
+    mov     x19, x0
+    mul     x20, x1, x2
+    add     x20, x20, x1, lsl #2        // packed bytes: OC*C + 4*OC
+    mov     x21, x3
+    mov     x9, x1
+    mov     x10, x2
+    mov     x0, x21
+    mov     x1, x19
+    mov     x2, x9
+    mov     x3, x10
+    bl      SYM(a_qpack_w)
+    mov     x0, x19
+    mov     x1, x21
+    lsr     x2, x20, #2                 // as floats
+    bl      copy_f32
+    ldp     x19, x20, [sp, #16]
+    ldr     x21, [sp, #32]
+    ldp     x29, x30, [sp], #48
+    ret
+
+// q8_all: int8-pack every matmul weight in place, int8 copy of wte
+    .p2align 4
+q8_all:
+    stp     x29, x30, [sp, #-96]!
+    mov     x29, sp
+    SAVE_X19_X28
+    LOADADDR x19, G
+    ldr     x20, [x19, #G_C]
+    ldr     x21, [x19, #G_L]
+    mul     x0, x20, x20
+    lsl     x0, x0, #3                  // scratch, more than 4C*C + 4*4C bytes
+    bl      xmalloc
+    mov     x22, x0
+    add     x24, x20, x20, lsl #1       // 3C
+    lsl     x25, x20, #2                // 4C
+    mov     x23, #0
+    ldr     x26, [x19, #G_SCALES]       // column scales (0 if not calibrated)
+    add     x27, x20, x20, lsl #1
+    add     x27, x27, x25               // 7C floats per layer
+1:  cmp     x23, x21
+    b.ge    2f
+    mul     x28, x23, x27               // this layer's scales: [C | C | C | 4C]
+    mul     x9, x23, x24
+    mul     x9, x9, x20
+    ldr     x0, [x19, #P_QKVW]
+    add     x0, x0, x9, lsl #2
+    mov     x1, x24
+    mov     x2, x20
+    mov     x3, x22
+    mov     x4, #0
+    cbz     x26, 11f
+    add     x4, x26, x28, lsl #2
+11: bl      q8_inplace
+    mul     x9, x23, x20
+    mul     x9, x9, x20
+    ldr     x0, [x19, #P_ATTPROJW]
+    add     x0, x0, x9, lsl #2
+    mov     x1, x20
+    mov     x2, x20
+    mov     x3, x22
+    mov     x4, #0
+    cbz     x26, 12f
+    add     x9, x28, x20
+    add     x4, x26, x9, lsl #2
+12: bl      q8_inplace
+    mul     x9, x23, x25
+    mul     x9, x9, x20
+    ldr     x0, [x19, #P_FCW]
+    add     x0, x0, x9, lsl #2
+    mov     x1, x25
+    mov     x2, x20
+    mov     x3, x22
+    mov     x4, #0
+    cbz     x26, 13f
+    add     x9, x28, x20, lsl #1
+    add     x4, x26, x9, lsl #2
+13: bl      q8_inplace
+    mul     x9, x23, x25
+    mul     x9, x9, x20
+    ldr     x0, [x19, #P_FCPROJW]
+    add     x0, x0, x9, lsl #2
+    mov     x1, x20
+    mov     x2, x25
+    mov     x3, x22
+    mov     x4, #0
+    cbz     x26, 14f
+    add     x9, x28, x20, lsl #1
+    add     x9, x9, x20
+    add     x4, x26, x9, lsl #2
+14: bl      q8_inplace
+    add     x23, x23, #1
+    b       1b
+2:  mov     x0, x22
+    bl      SYM(free)
+    ldr     x9, [x19, #G_VP]
+    mul     x0, x9, x20
+    add     x0, x0, x9, lsl #2
+    bl      xmalloc
+    str     x0, [x19, #G_WTE_PACKED]
+    ldr     x1, [x19, #P_WTE]
+    ldr     x2, [x19, #G_VP]
+    mov     x3, x20
+    mov     x4, #0
+    cbz     x26, 21f
+    mul     x9, x21, x27
+    add     x4, x26, x9, lsl #2         // final layernorm -> logits scales
+21: bl      SYM(a_qpack_w)
+    mov     x9, #3
+    str     x9, [x19, #G_PACKED]
+    LOADADDR x0, s_prec8
+    bl      pr0
+    RESTORE_X19_X28
+    ldp     x29, x30, [sp], #96
+    ret
+
+// smooth_one(stats, scales, W, OC, K): for each input channel k of W (OC x K):
+// s_k = sqrt(max|x_k| / max_o |W[o][k]|) (1 if either is 0), clamped to [1e-3, 1e3].
+// scales <- s (for the weights), stats <- 1/s (for the activations).
+    .p2align 4
+smooth_one:
+    stp     x29, x30, [sp, #-64]!
+    mov     x29, sp
+    stp     x19, x20, [sp, #16]
+    stp     x21, x22, [sp, #32]
+    str     x23, [sp, #48]
+    mov     x19, x0
+    mov     x20, x1
+    mov     x21, x4
+    mov     x23, x2
+    mov     x22, x3
+    mov     x9, #0
+1:  cmp     x9, x21
+    b.ge    2f
+    str     wzr, [x20, x9, lsl #2]
+    add     x9, x9, #1
+    b       1b
+2:  mov     x0, x20                     // scales <- column max of |W|
+    mov     x1, x23
+    mov     x2, x22
+    mov     x3, x21
+    bl      SYM(a_colmax)
+    MOV32   w9, 0x3A83126F              // 1e-3
+    fmov    s4, w9
+    MOV32   w9, 0x447A0000              // 1e3
+    fmov    s5, w9
+    fmov    s6, #1.0
+    mov     x9, #0
+3:  cmp     x9, x21
+    b.ge    6f
+    ldr     s0, [x19, x9, lsl #2]
+    ldr     s1, [x20, x9, lsl #2]
+    fmov    s2, #1.0
+    fcmp    s0, #0.0
+    b.eq    4f
+    fcmp    s1, #0.0
+    b.eq    4f
+    LOADADDR x10, G
+    ldr     x10, [x10, #G_ALPHA]
+    cmp     x10, #75
+    b.eq    41f
+    cmp     x10, #50
+    b.ne    42f
+    fdiv    s2, s0, s1                  // alpha 0.5: sqrt(ax / aw)
+    fsqrt   s2, s2
+    b       43f
+41: fmul    s2, s0, s0                  // alpha 0.75: (ax^3 / aw)^(1/4)
+    fmul    s2, s2, s0
+    fdiv    s2, s2, s1
+    fsqrt   s2, s2
+    fsqrt   s2, s2
+    b       43f
+42: fmul    s3, s1, s1                  // alpha 0.25 (default): (ax / aw^3)^(1/4)
+    fmul    s3, s3, s1
+    fdiv    s2, s0, s3
+    fsqrt   s2, s2
+    fsqrt   s2, s2
+43: fmax    s2, s2, s4
+    fmin    s2, s2, s5
+4:  str     s2, [x20, x9, lsl #2]
+    fdiv    s3, s6, s2
+    str     s3, [x19, x9, lsl #2]
+    add     x9, x9, #1
+    b       3b
+6:  ldp     x19, x20, [sp, #16]
+    ldp     x21, x22, [sp, #32]
+    ldr     x23, [sp, #48]
+    ldp     x29, x30, [sp], #64
+    ret
+
+// calibrate(path): fp32 forward passes over up to 16 windows of 64 tokens from an
+// llm.c token file, recording matmul input maxima, then smoothing factors.
+    .p2align 4
+calibrate:
+    stp     x29, x30, [sp, #-96]!
+    mov     x29, sp
+    SAVE_X19_X28
+    mov     x19, x0
+    LOADADDR x20, G
+    LOADADDR x1, s_rb
+    bl      SYM(fopen)
+    cbnz    x0, 1f
+    LOADADDR x0, s_err_open
+    mov     x1, x19
+    b       die
+1:  mov     x21, x0
+    add     x0, x20, #G_HEADER
+    mov     x1, #4
+    mov     x2, #256
+    mov     x3, x21
+    bl      xfread
+    ldr     w9, [x20, #G_HEADER]
+    MOV32   w10, 20240520
+    cmp     w9, w10
+    b.eq    2f
+    LOADADDR x0, s_err_data
+    b       die
+2:  ldrsw   x22, [x20, #(G_HEADER + 8)]
+    mov     x9, #1024
+    cmp     x22, x9
+    csel    x22, x9, x22, gt
+    lsr     x22, x22, #6
+    lsl     x22, x22, #6
+    cbnz    x22, 3f
+    LOADADDR x0, s_err_data
+    b       die
+3:  LOADADDR x0, s_env_alpha
+    bl      SYM(getenv)
+    mov     x9, #25
+    cbz     x0, 31f
+    bl      SYM(atoi)
+    sxtw    x9, w0
+31: str     x9, [x20, #G_ALPHA]
+    LOADADDR x0, s_calib
+    mov     x1, x22
+    bl      pr1
+    lsl     x0, x22, #1
+    bl      xmalloc
+    mov     x23, x0
+    mov     x1, #2
+    mov     x2, x22
+    mov     x3, x21
+    bl      xfread
+    mov     x0, x21
+    bl      SYM(fclose)
+    lsl     x0, x22, #2
+    bl      xmalloc
+    mov     x24, x0
+    mov     x9, #0
+4:  ldrh    w10, [x23, x9, lsl #1]
+    str     w10, [x24, x9, lsl #2]
+    add     x9, x9, #1
+    cmp     x9, x22
+    b.lt    4b
+    ldr     x25, [x20, #G_C]
+    ldr     x26, [x20, #G_L]
+    add     x27, x25, x25, lsl #1
+    add     x27, x27, x25, lsl #2       // 7C
+    mul     x28, x26, x27
+    add     x28, x28, x25               // stats floats
+    lsl     x0, x28, #2
+    bl      xmalloc
+    str     x0, [x20, #G_STATS]
+    mov     x9, #0
+5:  str     wzr, [x0, x9, lsl #2]
+    add     x9, x9, #1
+    cmp     x9, x28
+    b.lt    5b
+    lsl     x0, x28, #2
+    bl      xmalloc
+    str     x0, [x20, #G_SCALES]
+    mov     x0, #1
+    mov     x1, #64
+    bl      SYM(gpt2a_alloc_acts)
+    mov     x9, #1
+    str     x9, [x20, #G_CALIB]
+    mov     x21, #0
+6:  cmp     x21, x22
+    b.ge    7f
+    add     x0, x24, x21, lsl #2
+    mov     x1, #1
+    mov     x2, #64
+    bl      SYM(gpt2a_forward)
+    add     x21, x21, #64
+    b       6b
+7:  str     xzr, [x20, #G_CALIB]
+    mov     x21, #0                     // layer
+8:  cmp     x21, x26
+    b.ge    9f
+    mul     x22, x21, x27
+    ldr     x0, [x20, #G_STATS]         // qkv: 3C x C
+    add     x0, x0, x22, lsl #2
+    ldr     x1, [x20, #G_SCALES]
+    add     x1, x1, x22, lsl #2
+    add     x9, x25, x25, lsl #1
+    mul     x10, x21, x9
+    mul     x10, x10, x25
+    ldr     x2, [x20, #P_QKVW]
+    add     x2, x2, x10, lsl #2
+    mov     x3, x9
+    mov     x4, x25
+    bl      smooth_one
+    add     x9, x22, x25                // attproj: C x C
+    ldr     x0, [x20, #G_STATS]
+    add     x0, x0, x9, lsl #2
+    ldr     x1, [x20, #G_SCALES]
+    add     x1, x1, x9, lsl #2
+    mul     x10, x21, x25
+    mul     x10, x10, x25
+    ldr     x2, [x20, #P_ATTPROJW]
+    add     x2, x2, x10, lsl #2
+    mov     x3, x25
+    mov     x4, x25
+    bl      smooth_one
+    add     x9, x22, x25, lsl #1        // fc: 4C x C
+    ldr     x0, [x20, #G_STATS]
+    add     x0, x0, x9, lsl #2
+    ldr     x1, [x20, #G_SCALES]
+    add     x1, x1, x9, lsl #2
+    lsl     x11, x25, #2
+    mul     x10, x21, x11
+    mul     x10, x10, x25
+    ldr     x2, [x20, #P_FCW]
+    add     x2, x2, x10, lsl #2
+    mov     x3, x11
+    mov     x4, x25
+    bl      smooth_one
+    add     x9, x22, x25, lsl #1        // fcproj: C x 4C
+    add     x9, x9, x25
+    ldr     x0, [x20, #G_STATS]
+    add     x0, x0, x9, lsl #2
+    ldr     x1, [x20, #G_SCALES]
+    add     x1, x1, x9, lsl #2
+    lsl     x11, x25, #2
+    mul     x10, x21, x11
+    mul     x10, x10, x25
+    ldr     x2, [x20, #P_FCPROJW]
+    add     x2, x2, x10, lsl #2
+    mov     x3, x25
+    mov     x4, x11
+    bl      smooth_one
+    add     x21, x21, #1
+    b       8b
+9:  mul     x9, x26, x27                // logits: Vp x C (wte)
+    ldr     x0, [x20, #G_STATS]
+    add     x0, x0, x9, lsl #2
+    ldr     x1, [x20, #G_SCALES]
+    add     x1, x1, x9, lsl #2
+    ldr     x2, [x20, #P_WTE]
+    ldr     x3, [x20, #G_VP]
+    mov     x4, x25
+    bl      smooth_one
+    str     xzr, [x20, #G_ACT_CAP]      // the caller allocates its own activations
+    RESTORE_X19_X28
+    ldp     x29, x30, [sp], #96
+    ret
+
+// ===========================================================================
 // model// ===========================================================================
 // model
 
@@ -1528,11 +2698,37 @@ FUNC SYM(gpt2a_build_from_checkpoint)
     b.lt    7b
     mov     x0, x21
     bl      SYM(fclose)
-    // repack matmul weights for the 5x16 kernel when the shapes allow it
+    // repack matmul weights: fp16 5x32 kernel if asked for and C, Vp % 32 == 0,
+    // else fp32 5x16 kernel if C, Vp % 16 == 0, else leave them as they are
     ldr     x9, [x20, #G_C]
     ldr     x10, [x20, #G_VP]
-    orr     x9, x9, x10
-    tst     x9, #15                     // C and Vp multiples of 16
+    orr     x21, x9, x10
+    LOADADDR x0, s_env_prec
+    bl      SYM(getenv)
+    cbz     x0, 7f
+    ldr     w9, [x0]                    // "fp16"
+    MOV32   w10, 0x36317066
+    cmp     w9, w10
+    b.ne    6f
+    tst     x21, #31
+    b.ne    7f
+    bl      pack16_all
+    b       8f
+6:  MOV32   w10, 0x38746e69             // "int8"
+    cmp     w9, w10
+    b.ne    7f
+    tst     x21, #15
+    b.ne    7f
+    LOADADDR x0, s_env_calib
+    bl      SYM(getenv)
+    cbz     x0, 60f
+    bl      calibrate
+    b       61f
+60: LOADADDR x0, s_nocalib
+    bl      pr0
+61: bl      q8_all
+    b       8f
+7:  tst     x21, #15
     b.ne    8f
     bl      pack_all
 8:  RESTORE_X19_X28
@@ -1577,6 +2773,16 @@ FUNC SYM(gpt2a_alloc_acts)
     lsl     x0, x0, #8                  // maxT floats for each of 64 threads
     bl      xmalloc
     str     x0, [x19, #G_ACT_SCRATCH]
+    lsl     x0, x21, #3                 // 4*N*C halves
+    bl      xmalloc
+    str     x0, [x19, #G_ACT_H16]
+    lsl     x0, x21, #2                 // 4*N*C int8
+    bl      xmalloc
+    str     x0, [x19, #G_ACT_Q8]
+    add     x0, x20, #8                 // N + 8 row scales
+    lsl     x0, x0, #2
+    bl      xmalloc
+    str     x0, [x19, #G_ACT_XS]
     RESTORE_X19_X28
     ldp     x29, x30, [sp], #96
     ret
@@ -1627,6 +2833,8 @@ FUNC SYM(gpt2a_forward)
 7:  bl      threads_init
     bl      pool_start
     ldr     x23, [x28, #G_C]            // C
+    add     x27, x23, x23, lsl #1
+    add     x27, x27, x23, lsl #2       // 7C: per-layer stats stride
     // token + position embeddings
     ldr     x0, [x28, #G_ACT_X]
     mov     x1, x19
@@ -1651,7 +2859,7 @@ fwd_layer:
     add     x3, x3, x25, lsl #2
     mov     x4, x22
     mov     x5, x23
-    bl      SYM(a_layernorm_forward)
+    bl      playernorm
     // qkv = ln1 @ qkvw^T + qkvb
     add     x26, x23, x23, lsl #1       // 3C
     mul     x9, x25, x26
@@ -1665,6 +2873,8 @@ fwd_layer:
     mov     x4, x22
     mov     x5, x23
     mov     x6, x26
+    mul     x13, x24, x27
+    MMHOOK  x1, x22, x23, x13
     bl      pmatmul
     // attention
     ldr     x0, [x28, #G_ACT_ATTY]
@@ -1686,13 +2896,16 @@ fwd_layer:
     mov     x4, x22
     mov     x5, x23
     mov     x6, x23
+    mul     x13, x24, x27
+    add     x13, x13, x23
+    MMHOOK  x1, x22, x23, x13
     bl      pmatmul
     // residual
     ldr     x0, [x28, #G_ACT_X]
     mov     x1, x0
     ldr     x2, [x28, #G_ACT_PROJ]
     mul     x3, x22, x23
-    bl      SYM(a_residual_forward)
+    bl      presidual
     // ln2
     ldr     x0, [x28, #G_ACT_LN]
     ldr     x1, [x28, #G_ACT_X]
@@ -1702,7 +2915,7 @@ fwd_layer:
     add     x3, x3, x25, lsl #2
     mov     x4, x22
     mov     x5, x23
-    bl      SYM(a_layernorm_forward)
+    bl      playernorm
     // MLP up: fch = ln2 @ fcw^T + fcb
     lsl     x26, x23, #2                // 4C
     mul     x9, x25, x26
@@ -1716,6 +2929,9 @@ fwd_layer:
     mov     x4, x22
     mov     x5, x23
     mov     x6, x26
+    mul     x13, x24, x27
+    add     x13, x13, x23, lsl #1
+    MMHOOK  x1, x22, x23, x13
     bl      pmatmul
     // gelu, in place
     ldr     x0, [x28, #G_ACT_FCH]
@@ -1733,13 +2949,17 @@ fwd_layer:
     mov     x4, x22
     mov     x5, x26
     mov     x6, x23
+    mul     x13, x24, x27
+    add     x13, x13, x23, lsl #1
+    add     x13, x13, x23
+    MMHOOK  x1, x22, x26, x13
     bl      pmatmul
     // residual
     ldr     x0, [x28, #G_ACT_X]
     mov     x1, x0
     ldr     x2, [x28, #G_ACT_PROJ]
     mul     x3, x22, x23
-    bl      SYM(a_residual_forward)
+    bl      presidual
     add     x24, x24, #1
     b       fwd_layer
 fwd_final:
@@ -1750,7 +2970,7 @@ fwd_final:
     ldr     x3, [x28, #P_LNFB]
     mov     x4, x22
     mov     x5, x23
-    bl      SYM(a_layernorm_forward)
+    bl      playernorm
     // logits = lnf @ wte^T (weights tied, no bias), into the probs buffer
     ldr     x0, [x28, #G_ACT_PROBS]
     ldr     x1, [x28, #G_ACT_LN]
@@ -1761,6 +2981,9 @@ fwd_final:
     mov     x4, x22
     mov     x5, x23
     ldr     x6, [x28, #G_VP]
+    ldr     x9, [x28, #G_L]
+    mul     x13, x9, x27
+    MMHOOK  x1, x22, x23, x13
     bl      pmatmul
     // softmax, in place
     ldr     x0, [x28, #G_ACT_PROBS]
@@ -1960,6 +3183,7 @@ pool_run:
     ldp     x29, x30, [sp], #32
     ret
 
+
 // store x0..x6 as the task arguments
 .macro SET_TASK
     LOADADDR x9, G
@@ -1967,13 +3191,56 @@ pool_run:
     stp     x0, x1, [x9]
     stp     x2, x3, [x9, #16]
     stp     x4, x5, [x9, #32]
-    str     x6, [x9, #48]
+    stp     x6, x7, [x9, #48]
 .endm
 
 // parallel wrappers, same arguments as the single-threaded kernels
     .p2align 4
 pmatmul:                                // (out, inp, weight, bias, N, C, OC)
-    SET_TASK
+    LOADADDR x9, G
+    ldr     x10, [x9, #G_PACKED]
+    cmp     x10, #3
+    b.eq    2f
+    cmp     x10, #2
+    b.ne    1f
+    stp     x29, x30, [sp, #-80]!       // fp16: inp -> fp16 copy, then run on that
+    mov     x29, sp
+    stp     x0, x1, [sp, #16]
+    stp     x2, x3, [sp, #32]
+    stp     x4, x5, [sp, #48]
+    str     x6, [sp, #64]
+    ldr     x0, [x9, #G_ACT_H16]
+    mul     x2, x4, x5
+    bl      pconv16
+    ldp     x0, x1, [sp, #16]
+    ldp     x2, x3, [sp, #32]
+    ldp     x4, x5, [sp, #48]
+    ldr     x6, [sp, #64]
+    LOADADDR x9, G
+    ldr     x1, [x9, #G_ACT_H16]
+    ldp     x29, x30, [sp], #80
+    b       1f
+2:  stp     x29, x30, [sp, #-80]!       // int8: quantize the rows of inp, then run on that
+    mov     x29, sp
+    stp     x0, x1, [sp, #16]
+    stp     x2, x3, [sp, #32]
+    stp     x4, x5, [sp, #48]
+    str     x6, [sp, #64]
+    mov     x2, x1
+    mov     x3, x4
+    mov     x4, x5
+    mov     x5, x7                      // per-channel 1/s (or 0)
+    ldr     x0, [x9, #G_ACT_Q8]
+    ldr     x1, [x9, #G_ACT_XS]
+    bl      pquant
+    ldp     x0, x1, [sp, #16]
+    ldp     x2, x3, [sp, #32]
+    ldp     x4, x5, [sp, #48]
+    ldr     x6, [sp, #64]
+    LOADADDR x9, G
+    ldr     x1, [x9, #G_ACT_Q8]
+    ldp     x29, x30, [sp], #80
+1:  SET_TASK
     LOADADDR x0, par_matmul
     b       pool_run
     .p2align 4
@@ -2005,9 +3272,9 @@ par_matmul:
     add     x12, x11, x10
     sub     x12, x12, #1
     udiv    x12, x12, x10               // ceil(OC / n)
-    add     x12, x12, #15
-    lsr     x12, x12, #4
-    lsl     x12, x12, #4                // rounded up to 16
+    add     x12, x12, #31
+    lsr     x12, x12, #5
+    lsl     x12, x12, #5                // rounded up to 32
     mul     x13, x0, x12                // oA
     cmp     x13, x11
     b.ge    9f
@@ -2027,9 +3294,26 @@ par_matmul:
 1:  ldr     x4, [x15, #32]              // N
     sub     x6, x14, x13                // channels in this slice
     mov     x7, x11                     // ldo = OC
-    cbnz    x16, 2f
-    b       SYM(a_matmul_strided)
-2:  b       SYM(a_matmul_packed)
+    cbz     x16, 3f
+    cmp     x16, #2
+    b.eq    4f
+    cmp     x16, #3
+    b.eq    5f
+    b       SYM(a_matmul_packed)
+5:  ldr     x5, [x15, #40]              // int8: panels of 16 C + 64 bytes
+    ldr     x2, [x15, #16]
+    lsr     x9, x13, #4
+    lsl     x10, x5, #4
+    add     x10, x10, #64
+    mul     x9, x9, x10
+    add     x2, x2, x9
+    b       SYM(a_matmul_q8)
+3:  b       SYM(a_matmul_strided)
+4:  ldr     x5, [x15, #40]              // fp16: halves, so re-derive the offsets
+    ldr     x2, [x15, #16]
+    mul     x9, x13, x5
+    add     x2, x2, x9, lsl #1          // weight + oA*C halves
+    b       SYM(a_matmul_f16)
 9:  ret
 
 // attention: heads split evenly, one scratch row per part
@@ -2112,6 +3396,119 @@ par_softmax:
     add     x1, x1, x9, lsl #2
     b       SYM(a_softmax_forward)
 9:  ret
+
+
+// more parallel wrappers: input conversion, quantization, layernorm, residual
+    .p2align 4
+pconv16:                                // (dst16, src, n)
+    SET_TASK
+    LOADADDR x0, par_conv16
+    b       pool_run
+    .p2align 4
+pquant:                                 // (q, xs, x, N, C, chanmul)
+    SET_TASK
+    LOADADDR x0, par_quant
+    b       pool_run
+    .p2align 4
+playernorm:                             // (out, inp, w, b, N, C)
+    SET_TASK
+    LOADADDR x0, par_layernorm
+    b       pool_run
+    .p2align 4
+presidual:                              // (out, a, b, n)
+    SET_TASK
+    LOADADDR x0, par_residual
+    b       pool_run
+
+// split n elements in chunks of 16: x0 = part -> x13 = start, x2 = count (or ret)
+.macro SPLIT16 nslot
+    LOADADDR x9, G
+    ldr     x10, [x9, #G_NTHREADS]
+    add     x15, x9, #G_TASK
+    ldr     x11, [x15, #\nslot]
+    add     x12, x11, x10
+    sub     x12, x12, #1
+    udiv    x12, x12, x10
+    add     x12, x12, #15
+    lsr     x12, x12, #4
+    lsl     x12, x12, #4
+    mul     x13, x0, x12
+    cmp     x13, x11
+    b.ge    99f
+    sub     x2, x11, x13
+    cmp     x2, x12
+    csel    x2, x12, x2, gt
+.endm
+// split N rows evenly: x13 = first row, x14 = rows (or ret)
+.macro SPLITROWS nslot
+    LOADADDR x9, G
+    ldr     x10, [x9, #G_NTHREADS]
+    add     x15, x9, #G_TASK
+    ldr     x11, [x15, #\nslot]
+    add     x12, x11, x10
+    sub     x12, x12, #1
+    udiv    x12, x12, x10
+    mul     x13, x0, x12
+    cmp     x13, x11
+    b.ge    99f
+    sub     x14, x11, x13
+    cmp     x14, x12
+    csel    x14, x12, x14, gt
+.endm
+
+    .p2align 4
+par_conv16:
+    SPLIT16 16
+    ldr     x0, [x15, #0]
+    add     x0, x0, x13, lsl #1
+    ldr     x1, [x15, #8]
+    add     x1, x1, x13, lsl #2
+    b       SYM(a_f32_to_f16)
+99: ret
+
+    .p2align 4
+par_residual:
+    SPLIT16 24
+    mov     x3, x2
+    ldr     x0, [x15, #0]
+    add     x0, x0, x13, lsl #2
+    ldr     x1, [x15, #8]
+    add     x1, x1, x13, lsl #2
+    ldr     x2, [x15, #16]
+    add     x2, x2, x13, lsl #2
+    b       SYM(a_residual_forward)
+99: ret
+
+    .p2align 4
+par_quant:                              // rows of (q, xs, x, N, C, chanmul)
+    SPLITROWS 24
+    ldr     x4, [x15, #32]              // C
+    mul     x9, x13, x4
+    ldr     x0, [x15, #0]
+    add     x0, x0, x9                  // q + r0*C
+    ldr     x1, [x15, #8]
+    add     x1, x1, x13, lsl #2         // xs + r0
+    ldr     x2, [x15, #16]
+    add     x2, x2, x9, lsl #2          // x + r0*C
+    mov     x3, x14
+    ldr     x5, [x15, #40]
+    b       SYM(a_quant_rows)
+99: ret
+
+    .p2align 4
+par_layernorm:                          // rows of (out, inp, w, b, N, C)
+    SPLITROWS 32
+    ldr     x5, [x15, #40]              // C
+    mul     x9, x13, x5
+    ldr     x0, [x15, #0]
+    add     x0, x0, x9, lsl #2
+    ldr     x1, [x15, #8]
+    add     x1, x1, x9, lsl #2
+    ldr     x2, [x15, #16]
+    ldr     x3, [x15, #24]
+    mov     x4, x14
+    b       SYM(a_layernorm_forward)
+99: ret
 
 // ===========================================================================
 // sampler (llm.c: xorshift64* rng, sample from the cumulative distribution)
@@ -2385,6 +3782,17 @@ gen_done:
     RESTORE_X19_X28
     ldp     x29, x30, [sp], #96
     ret
+#endif
+
+
+// test hook: a_matmul_q8 with an explicit row-scale array (9th argument on the stack is
+// avoided: scales passed in G_ACT_XS). void a_matmul_q8_test(out, xq, wq, bias, N, C, OC, ldo, xs)
+#if defined(GPT2A_NO_MAIN)
+FUNC SYM(a_matmul_q8_test)
+    ldr     x9, [sp]                    // 9th argument (stack on both ABIs)
+    LOADADDR x10, G
+    str     x9, [x10, #G_ACT_XS]
+    b       SYM(a_matmul_q8)
 #endif
 
 #if !defined(__APPLE__)

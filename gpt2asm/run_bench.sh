@@ -38,7 +38,12 @@ $CC $FLAGS -DGPT2A_NO_MAIN -c gpt2_forward.S -o gpt2_nomain.o
 $CC $FLAGS -w -Illm.c test/bench.c gpt2_nomain.o -o bench $OMP -lm -lpthread
 $CC $FLAGS gpt2_forward.S -o gpt2 -lm -lpthread
 
-# 3. run on the train split (enough text for 1000 distinct samples)
+# 3. run on the train split (enough text for 1000 distinct samples).
+# int8 calibrates on the train split instead, and is evaluated on val.
 DATA=llm.c/dev/data/tinyshakespeare/tiny_shakespeare_train.bin
-echo "compiler: $($CC --version | head -1), flags: $FLAGS, threads: $TH"
+if [ "${GPT2A_PRECISION:-fp32}" = int8 ]; then
+    export GPT2A_CALIB=${GPT2A_CALIB:-$DATA}
+    DATA=llm.c/dev/data/tinyshakespeare/tiny_shakespeare_val.bin
+fi
+echo "compiler: $($CC --version | head -1), flags: $FLAGS, threads: $TH, precision: ${GPT2A_PRECISION:-fp32}"
 OMP_NUM_THREADS=$TH ./bench llm.c/gpt2_124M.bin "$DATA" "$N" "$T" 0 "$TH" | tee bench_results.txt
