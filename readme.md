@@ -28,6 +28,7 @@ At 4 threads that's about 340 tokens/s for llm.c versus 1,090 (fp32), 1,670 (fp1
 - **Machine:** MacBook Air (Apple M1), Linux arm64 VM with 4 cores, gcc 11.4 with `-Ofast -march=native`.
 - **Threading:** llm.c uses OpenMP; the assembly uses its own pthreads pool.
 - **Measurement:** the two programs run interleaved and take turns going first, so warm-up and the fanless Air's throttling hit both equally. Absolute times drift between runs; compare the ×llm.c ratios.
+- **OpenMP waiting:** run the 4-thread comparison with `OMP_WAIT_POLICY=passive`. By default, llm.c's OpenMP threads keep spinning for a while after each pass and steal cores from the assembly pass that follows. With `active` they never stop, and the assembly drops from 20 to 392 ms per pass. With `passive`, llm.c's own time barely changes (186 vs 189 ms), and int8 measures **9.53×** on 4 threads instead of 8.90×. `run_bench.sh` sets it.
 
 ## Optimization log
 

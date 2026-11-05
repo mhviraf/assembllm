@@ -46,4 +46,6 @@ if [ "${GPT2A_PRECISION:-fp32}" = int8 ]; then
     DATA=llm.c/dev/data/tinyshakespeare/tiny_shakespeare_val.bin
 fi
 echo "compiler: $($CC --version | head -1), flags: $FLAGS, threads: $TH, precision: ${GPT2A_PRECISION:-fp32}"
-OMP_NUM_THREADS=$TH ./bench llm.c/gpt2_124M.bin "$DATA" "$N" "$T" 0 "$TH" | tee bench_results.txt
+# passive: llm.c's idle OpenMP threads sleep instead of spinning, so they do not
+# steal cores from the assembly run that follows them in the interleaved benchmark
+OMP_WAIT_POLICY=passive OMP_NUM_THREADS=$TH ./bench llm.c/gpt2_124M.bin "$DATA" "$N" "$T" 0 "$TH" | tee bench_results.txt
