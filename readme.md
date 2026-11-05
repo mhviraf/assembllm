@@ -30,6 +30,20 @@ At 4 threads that's about 340 tokens/s for llm.c versus 1,090 (fp32), 1,670 (fp1
 - **Measurement:** the two programs run interleaved and take turns going first, so warm-up and the fanless Air's throttling hit both equally. Absolute times drift between runs; compare the ×llm.c ratios.
 - **OpenMP waiting:** run the 4-thread comparison with `OMP_WAIT_POLICY=passive`. By default, llm.c's OpenMP threads keep spinning for a while after each pass and steal cores from the assembly pass that follows. With `active` they never stop, and the assembly drops from 20 to 392 ms per pass. With `passive`, llm.c's own time barely changes (186 vs 189 ms), and int8 measures **9.53×** on 4 threads instead of 8.90×. `run_bench.sh` sets it.
 
+## Native macOS, including the AMX coprocessor
+
+These runs are native macOS on the same MacBook Air (M1), built without Xcode (see `gpt2asm/native/README.md`). They use 4 threads, the real weights and 40 forward passes of 64 tokens over Tiny Shakespeare val. Loss is the mean next-token loss over those passes; fp32 is the reference. llm.c isn't in this table because it can't be built natively here without Xcode.
+
+| Precision | ms per pass | Tokens/s | vs NEON fp32 | Loss |
+|---|---|---|---|---|
+| fp32, NEON | 49.8 | 1,284 | 1× | 5.2520 |
+| fp16, NEON | 28.0 | 2,286 | 1.78× | 5.2499 |
+| **fp32, AMX** (`amx`) | 30.0 | 2,135 | **1.66×** | 5.2520 (identical) |
+| **fp16 with fp32 sums, AMX** (`amx16`) | 18.3 | 3,501 | **2.72×** | 5.2519 |
+| int8, NEON (SmoothQuant) | 14.4 | 4,434 | 3.45× | 5.2686 |
+
+`amx16` is the fastest mode that keeps fp32's loss: int8 is about 25% faster but adds 0.017 nats.
+
 ## Optimization log
 
 ### Part 1: same math as llm.c (fp32)
@@ -103,6 +117,24 @@ int8 on 1 thread now takes about 52 ms per forward pass, split as follows:
 | Layernorm | 0.9 |
 | int8 input conversion | 0.8 |
 
+### Part 4: Apple's AMX matrix coprocessor (native macOS)
+
+The M1 has an undocumented matrix unit, AMX, next to the performance cores' shared L2. Each instruction does a 16 × 16 fp32 outer product (or 32 × 32 in fp16) into a 4 KB accumulator, which is far more math per instruction than NEON. The encoding comes from [corsix/amx](https://github.com/corsix/amx). AMX only works natively, not in a Linux VM, so step 14 first had to make native builds possible without Xcode.
+
+| # | Change | Native, 4 threads, ms per pass | Loss |
+|---|---|---|---|
+| 14 | Native macOS build without Xcode: clang + `ld64.lld` against a hand-written `libSystem.tbd` | baseline: NEON fp32 49.8 (fp16 28.0, int8 14.4) | – |
+| 15 | fp32 AMX kernel using only X0 / Y0 (the operand fields the first probe had confirmed), 2 AMX threads | 34.8 (1.40× NEON fp32) | identical |
+| 16 | Operand fields fixed, 128-byte pair loads, CPU prefetch of the weight stream, threads pinned to the performance cores, 4 AMX threads | **30.0** (1.66×) | identical |
+| 17 | fp16 weights and inputs with fp32 sums (`fma16` with fp32 accumulators), weights packed in the lane order AMX writes back | **18.3** (2.72×) | −0.0001 |
+
+14. **Building without Xcode.** `clang -target arm64-apple-macos11` makes Mach-O objects on Linux. `ld64.lld` links them against a text file that lists the libSystem functions used, and signs the result ad hoc. macOS runs it as is.
+15. **Finding out how AMX really behaves.** The first matmul got rows 0–15 right and everything after wrong. A register-by-register probe settled it: `fma32` takes the **Y** offset in bits 0–8 and the **X** offset in bits 10–18, the opposite of what the kernel assumed. Pair loads work, but only from 128-byte-aligned addresses; a 64-byte-aligned one is a bus error. Before the fix was known, a kernel that touches only X0 and Y0 avoided the question and already beat NEON fp32. `pmatmul` checks each AMX kernel against the NEON kernel on first use and keeps the first one that agrees.
+16. **Corrected kernels.** The faster kernels load 128 bytes at once and use all four accumulators. In isolation they reach 1.1–1.4 TFLOP/s, against about 0.4 for NEON on 4 cores. In a real forward pass the weights come from DRAM, and AMX loads alone don't keep enough of them in flight. So each kernel also prefetches its weight stream from the CPU side, and 4 threads issuing AMX work beat 2 (30 vs 39 ms), even though they share one AMX unit.
+17. **fp16 inputs, fp32 sums.** With bit 62 set, `fma16` multiplies 32 fp16 weights by 32 fp16 inputs into a 32 × 32 **fp32** tile. That halves the weight bytes and the load instructions, and each product is exact in fp32. Lane i of output row j lands in Z row 2j + i % 2, column i / 2. Packing each 32-channel panel in the order 0, 16, 1, 17, … makes each Z row hold 16 consecutive channels, so results store straight to memory. Unlike the NEON fp16 path, nothing is summed in fp16, and the loss matches fp32.
+
+`amx16` per-stage times (ms per pass): qkv 2.5, attention projection 0.9, MLP 3.3 + 3.6, logits 5.0, everything else 2.8. The matmuls still run about 20% slower than in isolation, where the weights stay cached.
+
 ## Reproduce
 
 ```sh
@@ -114,3 +146,10 @@ GPT2A_PROFILE=1 GPT2A_PRECISION=int8 ./run_bench.sh 100   # plus a per-stage tim
 ```
 
 On macOS, llm.c needs `brew install libomp` to run multi-threaded.
+
+Native macOS (no Xcode needed; the binaries are built on Linux by `gpt2asm/native/build.sh` and `gpt2asm/amx/build.sh`):
+
+```sh
+bash gpt2asm/amx/run_all.sh               # AMX kernel checks, then amx / amx16 / NEON timings -> gpt2asm/amx/results.txt
+cd gpt2asm/native && GPT2A_PRECISION=amx16 ./gpt2_profile ../../gpt2_124M.bin ../../tiny_shakespeare_val.bin 4 40
+```

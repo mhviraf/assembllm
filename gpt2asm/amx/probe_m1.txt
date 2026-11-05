@@ -1,0 +1,139 @@
+### amx_probe3
+Apple M1
+== 1. register index on single loads (pattern: reg r lane l = 1 + 16 r + l)
+X: ldx r -> stx r, lane 0 of each: X0[0] X1[0] X2[0] X3[0] X4[0] X5[0] X6[0] X7[0]
+X: X0 as seen by fma32 (no offsets): X0[0] X0[1] X0[15]
+Y: ldy r -> sty r, lane 0 of each: Y0[0] Y1[0] Y2[0] Y3[0] Y4[0] Y5[0] Y6[0] Y7[0]
+Y: Y0 as seen by fma32 (no offsets): Y0[0] Y0[1] Y0[15]
+== 2. fma32 operands
+fma32 X offset   0: Z row 0 lanes 0, 1, 15 = X0[0] X0[1] X0[15]
+fma32 X offset  64: Z row 0 lanes 0, 1, 15 = X0[0] X0[1] X0[15]
+fma32 X offset 128: Z row 0 lanes 0, 1, 15 = X0[0] X0[1] X0[15]
+fma32 X offset 192: Z row 0 lanes 0, 1, 15 = X0[0] X0[1] X0[15]
+fma32 X offset 448: Z row 0 lanes 0, 1, 15 = X0[0] X0[1] X0[15]
+fma32 X offset   4: Z row 0 lanes 0, 1, 15 = X0[0] X0[1] X0[15]
+fma32 X offset  32: Z row 0 lanes 0, 1, 15 = X0[0] X0[1] X0[15]
+fma32 Y offset   0: Z rows 0, 4, 60 lane 0 = Y0[0] Y0[1] Y0[15]
+fma32 Y offset  64: Z rows 0, 4, 60 lane 0 = Y0[0] Y0[1] Y0[15]
+fma32 Y offset 128: Z rows 0, 4, 60 lane 0 = Y0[0] Y0[1] Y0[15]
+fma32 Y offset 192: Z rows 0, 4, 60 lane 0 = Y0[0] Y0[1] Y0[15]
+fma32 Y offset 448: Z rows 0, 4, 60 lane 0 = Y0[0] Y0[1] Y0[15]
+fma32 Y offset   4: Z rows 0, 4, 60 lane 0 = Y0[0] Y0[1] Y0[15]
+fma32 Y offset  32: Z rows 0, 4, 60 lane 0 = Y0[0] Y0[1] Y0[15]
+fma32 Z offset 0: 16 rows written, first 0 4 8 12
+fma32 Z offset 1: 16 rows written, first 1 5 9 13
+fma32 Z offset 2: 16 rows written, first 2 6 10 14
+fma32 Z offset 3: 16 rows written, first 3 7 11 15
+fma32 Z offset 4: 16 rows written, first 0 4 8 12
+fma32 Z offset 5: 16 rows written, first 1 5 9 13
+   (no offsets: Z[4j][i] = (1 + i) * 100 (j + 1), e.g. Z[0][0] = 100, Z[0][1] = 200, Z[4][0] = 200)
+fma32 operand bit  0: 16 rows written, first  0; Z[first][0], Z[first][1], Z[first+4][0] = 6.13289e-39 1.22658e-38 6.17881e-39
+fma32 operand bit  1: 16 rows written, first  0; Z[first][0], Z[first][1], Z[first+4][0] = 2.39566e-41 4.79132e-41 2.4136e-41
+fma32 operand bit  2: 16 rows written, first  0; Z[first][0], Z[first][1], Z[first+4][0] = 200 400 300
+fma32 operand bit  3: 16 rows written, first  0; Z[first][0], Z[first][1], Z[first+4][0] = 300 600 400
+fma32 operand bit  4: 16 rows written, first  0; Z[first][0], Z[first][1], Z[first+4][0] = 500 1000 600
+fma32 operand bit  5: 16 rows written, first  0; Z[first][0], Z[first][1], Z[first+4][0] = 900 1800 1000
+fma32 operand bit  6: 16 rows written, first  0; Z[first][0], Z[first][1], Z[first+4][0] = 0 0 0
+fma32 operand bit  7: 16 rows written, first  0; Z[first][0], Z[first][1], Z[first+4][0] = 0 0 0
+fma32 operand bit  8: 16 rows written, first  0; Z[first][0], Z[first][1], Z[first+4][0] = 0 0 0
+fma32 operand bit  9: 16 rows written, first  0; Z[first][0], Z[first][1], Z[first+4][0] = 100 200 200
+fma32 operand bit 10: 16 rows written, first  0; Z[first][0], Z[first][1], Z[first+4][0] = 5.83155e-37 5.87747e-37 1.16631e-36
+fma32 operand bit 11: 16 rows written, first  0; Z[first][0], Z[first][1], Z[first+4][0] = 2.27795e-39 2.29589e-39 4.5559e-39
+fma32 operand bit 12: 16 rows written, first  0; Z[first][0], Z[first][1], Z[first+4][0] = 200 300 400
+fma32 operand bit 13: 16 rows written, first  0; Z[first][0], Z[first][1], Z[first+4][0] = 300 400 600
+fma32 operand bit 14: 16 rows written, first  0; Z[first][0], Z[first][1], Z[first+4][0] = 500 600 1000
+fma32 operand bit 15: 16 rows written, first  0; Z[first][0], Z[first][1], Z[first+4][0] = 900 1000 1800
+fma32 operand bit 16: 16 rows written, first  0; Z[first][0], Z[first][1], Z[first+4][0] = 0 0 0
+fma32 operand bit 17: 16 rows written, first  0; Z[first][0], Z[first][1], Z[first+4][0] = 0 0 0
+fma32 operand bit 18: 16 rows written, first  0; Z[first][0], Z[first][1], Z[first+4][0] = 0 0 0
+fma32 operand bit 19: 16 rows written, first  0; Z[first][0], Z[first][1], Z[first+4][0] = 100 200 200
+== 3. loads: which src index (src[i] = i) lands in registers 0..7 (. = untouched)
+ldx single  r0 +  0B:   0   .   .   .   .   .   .   .
+ldx single  r0 + 64B:  16   .   .   .   .   .   .   .
+ldx single  r0 +128B:  32   .   .   .   .   .   .   .
+ldx single  r3 +  0B:   .   .   .   0   .   .   .   .
+ldx single  r3 + 64B:   .   .   .  16   .   .   .   .
+ldx single  r3 +128B:   .   .   .  32   .   .   .   .
+ldx single  r6 +  0B:   .   .   .   .   .   .   0   .
+ldx single  r6 + 64B:   .   .   .   .   .   .  16   .
+ldx single  r6 +128B:   .   .   .   .   .   .  32   .
+ldx b62     r0 +  0B:   0  16   .   .   .   .   .   .
+   ^ crashed (signal 10)
+ldx b62     r0 +128B:  32  48   .   .   .   .   .   .
+ldx b62     r3 +  0B:   .   .   .   0  16   .   .   .
+   ^ crashed (signal 10)
+ldx b62     r3 +128B:   .   .   .  32  48   .   .   .
+ldx b62     r6 +  0B:   .   .   .   .   .   .   0  16
+   ^ crashed (signal 10)
+ldx b62     r6 +128B:   .   .   .   .   .   .  32  48
+ldx b62+61  r0 +  0B:   0  16   .   .   .   .   .   .
+   ^ crashed (signal 10)
+ldx b62+61  r0 +128B:  32  48   .   .   .   .   .   .
+ldx b62+61  r3 +  0B:   .   .   .   0  16   .   .   .
+   ^ crashed (signal 10)
+ldx b62+61  r3 +128B:   .   .   .  32  48   .   .   .
+ldx b62+61  r6 +  0B:   .   .   .   .   .   .   0  16
+   ^ crashed (signal 10)
+ldx b62+61  r6 +128B:   .   .   .   .   .   .  32  48
+ldx b62+60  r0 +  0B:   0  16   .   .   .   .   .   .
+   ^ crashed (signal 10)
+ldx b62+60  r0 +128B:  32  48   .   .   .   .   .   .
+ldx b62+60  r3 +  0B:   .   .   .   0  16   .   .   .
+   ^ crashed (signal 10)
+ldx b62+60  r3 +128B:   .   .   .  32  48   .   .   .
+ldx b62+60  r6 +  0B:   .   .   .   .   .   .   0  16
+   ^ crashed (signal 10)
+ldx b62+60  r6 +128B:   .   .   .   .   .   .  32  48
+ldx b61     r0 +  0B:   0   .   .   .   .   .   .   .
+ldx b61     r0 + 64B:  16   .   .   .   .   .   .   .
+ldx b61     r0 +128B:  32   .   .   .   .   .   .   .
+ldx b61     r3 +  0B:   .   .   .   0   .   .   .   .
+ldx b61     r3 + 64B:   .   .   .  16   .   .   .   .
+ldx b61     r3 +128B:   .   .   .  32   .   .   .   .
+ldx b61     r6 +  0B:   .   .   .   .   .   .   0   .
+ldx b61     r6 + 64B:   .   .   .   .   .   .  16   .
+ldx b61     r6 +128B:   .   .   .   .   .   .  32   .
+ldx b60     r0 +  0B:   0   .   .   .   .   .   .   .
+ldx b60     r0 + 64B:  16   .   .   .   .   .   .   .
+ldx b60     r0 +128B:  32   .   .   .   .   .   .   .
+ldx b60     r3 +  0B:   .   .   .   0   .   .   .   .
+ldx b60     r3 + 64B:   .   .   .  16   .   .   .   .
+ldx b60     r3 +128B:   .   .   .  32   .   .   .   .
+ldx b60     r6 +  0B:   .   .   .   .   .   .   0   .
+ldx b60     r6 + 64B:   .   .   .   .   .   .  16   .
+ldx b60     r6 +128B:   .   .   .   .   .   .  32   .
+ldy b62     r0 +  0B:   0  16   .   .   .   .   .   .
+   ^ crashed (signal 10)
+ldy b62     r0 +128B:  32  48   .   .   .   .   .   .
+ldy b62     r3 +  0B:   .   .   .   0  16   .   .   .
+   ^ crashed (signal 10)
+ldy b62     r3 +128B:   .   .   .  32  48   .   .   .
+ldy b62     r6 +  0B:   .   .   .   .   .   .   0  16
+   ^ crashed (signal 10)
+ldy b62     r6 +128B:   .   .   .   .   .   .  32  48
+== 4. fma16 with fp32 sums (bit 62): where X[i] * Y[j] goes (i, j < 32)
+fma16 fp32 sums, Z offset 0: 1024 of 1024 cells written; Z[2j + i%2][i/2] matches 1024, Z[2j + i/16][i%16] matches 64
+  Z row 0 holds (i,j): 0,0 2,0 4,0 6,0 8,0 10,0 12,0 14,0 16,0 18,0 20,0 22,0 24,0 26,0 28,0 30,0
+  Z row 1 holds (i,j): 1,0 3,0 5,0 7,0 9,0 11,0 13,0 15,0 17,0 19,0 21,0 23,0 25,0 27,0 29,0 31,0
+  Z row 2 holds (i,j): 0,1 2,1 4,1 6,1 8,1 10,1 12,1 14,1 16,1 18,1 20,1 22,1 24,1 26,1 28,1 30,1
+  Z row 3 holds (i,j): 1,1 3,1 5,1 7,1 9,1 11,1 13,1 15,1 17,1 19,1 21,1 23,1 25,1 27,1 29,1 31,1
+fma16 fp32 sums, Z offset 1: 1024 of 1024 cells written; Z[2j + i%2][i/2] matches 1024, Z[2j + i/16][i%16] matches 64
+fma16 fp32 sums, Z offset 2: 1024 of 1024 cells written; Z[2j + i%2][i/2] matches 1024, Z[2j + i/16][i%16] matches 64
+== 5. throughput
+fma16 fp32 sums, z 0/1 alternating, no loads   1 thread    1285 GFLOP/s
+fma16 fp32 sums, z 0/1 alternating, no loads   2 threads   1403 GFLOP/s
+fma16 fp32 sums, z 0/1 alternating, no loads   4 threads   1451 GFLOP/s
+fma16 fp32 sums, one accumulator, no loads     1 thread    1388 GFLOP/s
+fma16 fp32 sums, one accumulator, no loads     2 threads   1346 GFLOP/s
+fma16 fp32 sums, one accumulator, no loads     4 threads   1456 GFLOP/s
+ldx + ldy + fma16 fp32 sums (32x32 per k)      1 thread    1421 GFLOP/s
+ldx + ldy + fma16 fp32 sums (32x32 per k)      2 threads   1540 GFLOP/s
+ldx + ldy + fma16 fp32 sums (32x32 per k)      4 threads   1640 GFLOP/s
+2 ldx + 2 ldy + 4 fma32 (amx32 kernel step)    1 thread    1520 GFLOP/s
+2 ldx + 2 ldy + 4 fma32 (amx32 kernel step)    2 threads   1625 GFLOP/s
+2 ldx + 2 ldy + 4 fma32 (amx32 kernel step)    4 threads   1638 GFLOP/s
+ldx b62 + ldy b62 + 4 fma32 (pair step)        1 thread    1520 GFLOP/s
+ldx b62 + ldy b62 + 4 fma32 (pair step)        2 threads   1627 GFLOP/s
+ldx b62 + ldy b62 + 4 fma32 (pair step)        4 threads   1630 GFLOP/s
+
+PROBE 3 DONE

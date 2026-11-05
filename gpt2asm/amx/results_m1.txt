@@ -1,0 +1,177 @@
+### amx_mm_test
+== correctness
+amx32  n=64  C=768   OC=64    bias=1  max|diff| 3.24e-05 (max|out| 38.0)  OK
+amx32  n=64  C=768   OC=64    bias=0  max|diff| 3.43e-05 (max|out| 37.1)  OK
+amx32  n=37  C=768   OC=48    bias=1  max|diff| 3.62e-05 (max|out| 34.3)  OK
+amx32  n=1   C=16    OC=16    bias=1  max|diff| 1.49e-07 (max|out| 2.6)  OK
+amx32  n=64  C=3072  OC=32    bias=1  max|diff| 1.16e-04 (max|out| 68.3)  OK
+amx32  n=13  C=64    OC=16    bias=0  max|diff| 1.43e-06 (max|out| 7.3)  OK
+amx32  n=64  C=768   OC=96    bias=1  max|diff| 3.81e-05 (max|out| 35.4)  OK
+amx32  n=50  C=128   OC=2304  bias=1  max|diff| 9.54e-06 (max|out| 16.5)  OK
+amx16  n=64  C=768   OC=64    bias=1  max|diff| 4.01e-05 (max|out| 33.5)  OK
+amx16  n=64  C=768   OC=64    bias=0  max|diff| 4.58e-05 (max|out| 34.3)  OK
+amx16  n=37  C=768   OC=48    bias=1  max|diff| 3.81e-05 (max|out| 33.1)  OK
+amx16  n=1   C=16    OC=16    bias=1  max|diff| 2.38e-07 (max|out| 3.1)  OK
+amx16  n=64  C=3072  OC=32    bias=1  max|diff| 9.54e-05 (max|out| 57.1)  OK
+amx16  n=13  C=64    OC=16    bias=0  max|diff| 2.38e-06 (max|out| 7.3)  OK
+amx16  n=64  C=768   OC=96    bias=1  max|diff| 2.96e-05 (max|out| 34.9)  OK
+amx16  n=50  C=128   OC=2304  bias=1  max|diff| 7.63e-06 (max|out| 18.7)  OK
+amxr0  n=64  C=768   OC=64    bias=1  max|diff| 4.58e-05 (max|out| 35.1)  OK
+amxr0  n=64  C=768   OC=64    bias=0  max|diff| 3.62e-05 (max|out| 33.7)  OK
+amxr0  n=37  C=768   OC=48    bias=1  max|diff| 2.86e-05 (max|out| 36.3)  OK
+amxr0  n=1   C=16    OC=16    bias=1  max|diff| 2.38e-07 (max|out| 3.9)  OK
+amxr0  n=64  C=3072  OC=32    bias=1  max|diff| 1.68e-04 (max|out| 74.9)  OK
+amxr0  n=13  C=64    OC=16    bias=0  max|diff| 1.67e-06 (max|out| 7.5)  OK
+amxr0  n=64  C=768   OC=96    bias=1  max|diff| 2.67e-05 (max|out| 31.8)  OK
+amxr0  n=50  C=128   OC=2304  bias=1  max|diff| 8.58e-06 (max|out| 17.6)  OK
+amxh   n=64  C=768   OC=64    bias=1  max|diff| 3.43e-05 (max|out| 34.3)  OK
+amxh   n=64  C=768   OC=64    bias=0  max|diff| 3.81e-05 (max|out| 39.8)  OK
+amxh   n=64  C=3072  OC=32    bias=1  max|diff| 1.18e-04 (max|out| 64.8)  OK
+amxh   n=64  C=768   OC=96    bias=1  max|diff| 3.24e-05 (max|out| 36.1)  OK
+amxh   n=50  C=128   OC=2304  bias=1  max|diff| 8.58e-06 (max|out| 16.9)  OK
+== speed (GPT-2 124M shapes, 64 tokens; best of 3)
+amx32  qkv      64 x 768   x 2304   1 thread     0.241 ms     941 GFLOP/s
+amx32  attproj  64 x 768   x 768    1 thread     0.067 ms    1134 GFLOP/s
+amx32  fc       64 x 768   x 3072   1 thread     0.254 ms    1189 GFLOP/s
+amx32  fcproj   64 x 3072  x 768    1 thread     0.238 ms    1267 GFLOP/s
+amx32  logits   64 x 768   x 50304  1 thread     7.656 ms     646 GFLOP/s
+amx32  qkv      64 x 768   x 2304   2 threads    0.203 ms    1114 GFLOP/s
+amx32  attproj  64 x 768   x 768    2 threads    0.065 ms    1167 GFLOP/s
+amx32  fc       64 x 768   x 3072   2 threads    0.314 ms     962 GFLOP/s
+amx32  fcproj   64 x 3072  x 768    2 threads    0.251 ms    1204 GFLOP/s
+amx32  logits   64 x 768   x 50304  2 threads    5.716 ms     865 GFLOP/s
+amx32  qkv      64 x 768   x 2304   4 threads    0.176 ms    1285 GFLOP/s
+amx32  attproj  64 x 768   x 768    4 threads    0.062 ms    1223 GFLOP/s
+amx32  fc       64 x 768   x 3072   4 threads    0.235 ms    1285 GFLOP/s
+amx32  fcproj   64 x 3072  x 768    4 threads    0.216 ms    1401 GFLOP/s
+amx32  logits   64 x 768   x 50304  4 threads    5.318 ms     930 GFLOP/s
+amx16  qkv      64 x 768   x 2304   1 thread     0.213 ms    1065 GFLOP/s
+amx16  attproj  64 x 768   x 768    1 thread     0.065 ms    1167 GFLOP/s
+amx16  fc       64 x 768   x 3072   1 thread     0.298 ms    1013 GFLOP/s
+amx16  fcproj   64 x 3072  x 768    1 thread     0.239 ms    1265 GFLOP/s
+amx16  logits   64 x 768   x 50304  1 thread     6.179 ms     800 GFLOP/s
+amx16  qkv      64 x 768   x 2304   2 threads    0.196 ms    1157 GFLOP/s
+amx16  attproj  64 x 768   x 768    2 threads    0.065 ms    1170 GFLOP/s
+amx16  fc       64 x 768   x 3072   2 threads    0.258 ms    1168 GFLOP/s
+amx16  fcproj   64 x 3072  x 768    2 threads    0.233 ms    1295 GFLOP/s
+amx16  logits   64 x 768   x 50304  2 threads    5.222 ms     947 GFLOP/s
+amx16  qkv      64 x 768   x 2304   4 threads    0.183 ms    1239 GFLOP/s
+amx16  attproj  64 x 768   x 768    4 threads    0.063 ms    1197 GFLOP/s
+amx16  fc       64 x 768   x 3072   4 threads    0.238 ms    1269 GFLOP/s
+amx16  fcproj   64 x 3072  x 768    4 threads    0.209 ms    1447 GFLOP/s
+amx16  logits   64 x 768   x 50304  4 threads    4.934 ms    1002 GFLOP/s
+amxr0  qkv      64 x 768   x 2304   1 thread     0.203 ms    1118 GFLOP/s
+amxr0  attproj  64 x 768   x 768    1 thread     0.068 ms    1113 GFLOP/s
+amxr0  fc       64 x 768   x 3072   1 thread     0.319 ms     947 GFLOP/s
+amxr0  fcproj   64 x 3072  x 768    1 thread     0.258 ms    1172 GFLOP/s
+amxr0  logits   64 x 768   x 50304  1 thread     5.930 ms     834 GFLOP/s
+amxr0  qkv      64 x 768   x 2304   2 threads    0.203 ms    1115 GFLOP/s
+amxr0  attproj  64 x 768   x 768    2 threads    0.065 ms    1170 GFLOP/s
+amxr0  fc       64 x 768   x 3072   2 threads    0.257 ms    1175 GFLOP/s
+amxr0  fcproj   64 x 3072  x 768    2 threads    0.231 ms    1306 GFLOP/s
+amxr0  logits   64 x 768   x 50304  2 threads    5.151 ms     960 GFLOP/s
+amxr0  qkv      64 x 768   x 2304   4 threads    0.185 ms    1226 GFLOP/s
+amxr0  attproj  64 x 768   x 768    4 threads    0.063 ms    1193 GFLOP/s
+amxr0  fc       64 x 768   x 3072   4 threads    0.244 ms    1237 GFLOP/s
+amxr0  fcproj   64 x 3072  x 768    4 threads    0.215 ms    1407 GFLOP/s
+amxr0  logits   64 x 768   x 50304  4 threads    5.864 ms     843 GFLOP/s
+amxh   qkv      64 x 768   x 2304   1 thread     0.186 ms    1219 GFLOP/s
+amxh   attproj  64 x 768   x 768    1 thread     0.058 ms    1304 GFLOP/s
+amxh   fc       64 x 768   x 3072   1 thread     0.231 ms    1307 GFLOP/s
+amxh   fcproj   64 x 3072  x 768    1 thread     0.204 ms    1479 GFLOP/s
+amxh   logits   64 x 768   x 50304  1 thread     4.840 ms    1022 GFLOP/s
+amxh   qkv      64 x 768   x 2304   2 threads    0.176 ms    1290 GFLOP/s
+amxh   attproj  64 x 768   x 768    2 threads    0.058 ms    1306 GFLOP/s
+amxh   fc       64 x 768   x 3072   2 threads    0.232 ms    1300 GFLOP/s
+amxh   fcproj   64 x 3072  x 768    2 threads    0.219 ms    1380 GFLOP/s
+amxh   logits   64 x 768   x 50304  2 threads    4.382 ms    1128 GFLOP/s
+amxh   qkv      64 x 768   x 2304   4 threads    0.169 ms    1337 GFLOP/s
+amxh   attproj  64 x 768   x 768    4 threads    0.059 ms    1271 GFLOP/s
+amxh   fc       64 x 768   x 3072   4 threads    0.230 ms    1313 GFLOP/s
+amxh   fcproj   64 x 3072  x 768    4 threads    0.212 ms    1426 GFLOP/s
+amxh   logits   64 x 768   x 50304  4 threads    4.517 ms    1095 GFLOP/s
+
+PASSED: amx32 amx16 amxr0 amxh
+FAILED:
+
+### forward pass, 64 tokens, 4 threads
+--- amx, GPT2A_AMX_THREADS=2
+[GPT-2 forward, ARM64 assembly]
+precision: fp32 on the AMX matrix coprocessor
+amx kernel: 32 x 32 tiles
+threads 4: 38.80 ms per forward pass of 64 tokens (1649 tokens/s), mean loss 5.2520
+per forward pass (assembly, averaged over 41 passes):
+  encoder            0.038 ms
+  layernorm          0.411 ms
+  qkv matmul         5.361 ms
+  attention          1.551 ms
+  attproj matmul     1.845 ms
+  residual           0.167 ms
+  fc matmul          6.926 ms
+  gelu               1.888 ms
+  fcproj matmul      6.883 ms
+  logits matmul     11.502 ms
+  softmax            2.132 ms
+  input convert      0.000 ms
+  total             38.706 ms
+--- amx, GPT2A_AMX_THREADS=4
+[GPT-2 forward, ARM64 assembly]
+precision: fp32 on the AMX matrix coprocessor
+amx kernel: 32 x 32 tiles
+threads 4: 29.97 ms per forward pass of 64 tokens (2135 tokens/s), mean loss 5.2520
+per forward pass (assembly, averaged over 41 passes):
+  encoder            0.030 ms
+  layernorm          0.367 ms
+  qkv matmul         3.870 ms
+  attention          0.911 ms
+  attproj matmul     1.451 ms
+  residual           0.154 ms
+  fc matmul          5.508 ms
+  gelu               1.356 ms
+  fcproj matmul      5.155 ms
+  logits matmul      8.864 ms
+  softmax            2.230 ms
+  input convert      0.000 ms
+  total             29.897 ms
+--- amx16, GPT2A_AMX_THREADS=2
+[GPT-2 forward, ARM64 assembly]
+precision: fp16 weights and matmul inputs on the AMX matrix coprocessor, fp32 sums
+threads 4: 26.88 ms per forward pass of 64 tokens (2381 tokens/s), mean loss 5.2519
+per forward pass (assembly, averaged over 41 passes):
+  encoder            0.035 ms
+  layernorm          0.314 ms
+  qkv matmul         3.181 ms
+  attention          0.891 ms
+  attproj matmul     1.122 ms
+  residual           0.087 ms
+  fc matmul          4.349 ms
+  gelu               1.278 ms
+  fcproj matmul      4.539 ms
+  logits matmul      9.276 ms
+  softmax            1.758 ms
+  input convert      0.000 ms
+  total             26.832 ms
+--- amx16, GPT2A_AMX_THREADS=4
+[GPT-2 forward, ARM64 assembly]
+precision: fp16 weights and matmul inputs on the AMX matrix coprocessor, fp32 sums
+threads 4: 18.28 ms per forward pass of 64 tokens (3501 tokens/s), mean loss 5.2519
+per forward pass (assembly, averaged over 41 passes):
+  encoder            0.027 ms
+  layernorm          0.281 ms
+  qkv matmul         2.501 ms
+  attention          0.658 ms
+  attproj matmul     0.913 ms
+  residual           0.076 ms
+  fc matmul          3.341 ms
+  gelu               1.052 ms
+  fcproj matmul      3.605 ms
+  logits matmul      5.039 ms
+  softmax            0.688 ms
+  input convert      0.000 ms
+  total             18.182 ms
+--- fp32 NEON
+threads 4: 49.83 ms per forward pass of 64 tokens (1284 tokens/s), mean loss 5.2520
+--- int8 NEON (calibrated)
+threads 4: 14.43 ms per forward pass of 64 tokens (4434 tokens/s), mean loss 5.2686
+
+ALL DONE

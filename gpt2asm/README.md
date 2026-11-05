@@ -22,9 +22,10 @@ The same source also builds on aarch64 Linux.
 - **Precision:** set `GPT2A_PRECISION` to `fp32` (the default, matches llm.c), `fp16` (2× the math per instruction, practically lossless) or `int8` (4×).
   - For int8, also set `GPT2A_CALIB=<llm.c token file>` so it can calibrate (SmoothQuant). Without that, int8 is much less accurate.
   - `GPT2A_SQ_ALPHA=25|50|75` sets the SmoothQuant balance; the default is 25.
-  - `amx` (experimental, native macOS only) runs the fp32 matmuls on Apple's AMX matrix coprocessor. See `amx/README.md`.
+  - `amx` (native macOS only) runs the fp32 matmuls on Apple's AMX matrix coprocessor: same math as fp32, about 1.7× faster than NEON fp32.
+  - `amx16` (native macOS only) runs fp16 weights and inputs on AMX with fp32 sums: practically lossless, the fastest mode that keeps fp32-level loss. See `amx/README.md`.
 - **Native macOS without Xcode:** `native/build.sh` cross-builds macOS binaries on Linux. See `native/README.md`.
-- **libc use:** limited to file I/O, `malloc`/`free`, `printf`/`putchar`, `getenv`/`atoi`/`sysconf` and `pthread_create`/`pthread_join`.
+- **libc use:** limited to file I/O, `malloc`/`free`, `printf`/`putchar`, `getenv`/`atoi`/`sysconf` and `pthread_create`/`pthread_join` (plus `sysctlbyname` and `pthread_set_qos_class_self_np` on macOS, to find and stay on the performance cores).
 
 ## Check it against llm.c
 

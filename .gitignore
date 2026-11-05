@@ -22,3 +22,5 @@ gpt2asm/amx/amx_probe
 gpt2asm/amx/amx_mm_test
 gpt2asm/amx/amx_probe.txt
 *.o
+gpt2asm/amx/amx_probe3
+gpt2asm/amx/results.txt
