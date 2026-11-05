@@ -9,7 +9,7 @@
 //     ./gpt2 [gpt2_124M.bin] [gpt2_tokenizer.bin] [num_tokens]
 //
 // Only libc is used: fopen/fread/fclose, malloc/free, printf/putchar/fflush,
-// atoi, getenv, sysconf, clock, exit, and pthread_create/join. Everything else,
+// atoi, getenv, sysconf, clock_gettime, exit, and pthread_create/join. Everything else,
 // including exp and tanh (vectorized, Cephes-style polynomial), is written by hand.
 //
 // Matmuls: at load time each weight matrix is repacked into panels of 16 output
@@ -474,6 +474,10 @@
 .equ G_AMX_FN,      2504     // AMX: matmul kernel picked by amx_select (0 = not yet)
 .equ G_AMX_PARTS,   2512     // AMX: threads that run matmuls (GPT2A_AMX_THREADS; 0 = all)
 .equ G_F16I,        2520     // 1: fp16 panels in interleaved lane order (for the AMX fp16 kernel)
+.equ G_KV,          2528     // KV cache: per layer maxT rows of q,k,v (L x maxT x 3C floats)
+.equ G_KV_ON,       2536     // 1 during gpt2a_forward_kv
+.equ G_KV_POS0,     2544     // gpt2a_forward_kv: position of the first new token
+.equ G_ATT_T0,      2552     // attention: first query position computed (0 = all)
 .equ G_SIZE,        2560
 .equ NPROF,         12
 .equ KC16,          64       // fp16 accumulation block before folding into fp32
@@ -535,7 +539,7 @@ s_cfg_C:         .asciz "channels: %ld\n"
 s_cfg_np:        .asciz "num_parameters: %ld\n"
 s_generating:    .asciz "generating:\n---\n"
 s_tokid:         .asciz "%ld "
-s_timing:        .asciz "\n---\ngenerated %ld tokens in %.2f s (CPU time)\n"
+s_timing:        .asciz "\n---\ngenerated %ld tokens in %.2f s (%.1f tokens/s)\n"
 s_err_open:      .asciz "Error: could not open file %s\n"
 s_err_read:      .asciz "Error: short read from file\n"
 s_err_magic:     .asciz "Bad magic model file\n"
@@ -630,6 +634,42 @@ pr1f:
     bl      SYM(printf)
     mov     sp, x29
     ldp     x29, x30, [sp], #16
+    ret
+
+// printf with an integer then two doubles: x0 = format, x1, d0, d1
+    .p2align 4
+pr1ff:
+    stp     x29, x30, [sp, #-16]!
+    mov     x29, sp
+    sub     sp, sp, #32
+    str     x1, [sp]
+    str     d0, [sp, #8]
+    str     d1, [sp, #16]
+    bl      SYM(printf)
+    mov     sp, x29
+    ldp     x29, x30, [sp], #16
+    ret
+
+// d0 = wall-clock seconds (CLOCK_MONOTONIC)
+    .p2align 4
+now_seconds:
+    stp     x29, x30, [sp, #-32]!
+    mov     x29, sp
+#if defined(__APPLE__)
+    mov     x0, #6                      // CLOCK_MONOTONIC on macOS
+#else
+    mov     x0, #1                      // CLOCK_MONOTONIC on Linux
+#endif
+    add     x1, sp, #16
+    bl      SYM(clock_gettime)
+    ldp     x9, x10, [sp, #16]
+    scvtf   d0, x9
+    scvtf   d1, x10
+    MOV32   w9, 0x3089705F              // 1e-9f
+    fmov    s2, w9
+    fcvt    d2, s2
+    fmadd   d0, d1, d2, d0
+    ldp     x29, x30, [sp], #32
     ret
 
 // print a message (x0 = format, x1 = optional arg) and exit(1). Never returns.
@@ -1069,7 +1109,8 @@ FUNC SYM(a_attention_forward)
 
 // void a_attention_heads(float* out, const float* qkv, float* scratch,
 //                        long B, long T, long C, long NH, long h0 | (h1 << 32))
-// Attention for heads h0 .. h1-1 only (one thread's share).
+// Attention for heads h0 .. h1-1 only (one thread's share). Queries start at G_ATT_T0
+// (normally 0); then out row t - t0 holds query t, and B must be 1.
 FUNC SYM(a_attention_heads)
     stp     x29, x30, [sp, #-208]!
     mov     x29, sp
@@ -1080,7 +1121,11 @@ FUNC SYM(a_attention_heads)
     stp     d14, d15, [sp, #176]
     // locals: [sp, #144] first head offset, [sp, #152] end head offset,
     //         [sp, #192] scale (fp32 bits); x16 = 1 for the head-size-64 fast path
-    mov     x19, x0                     // out
+    LOADADDR x9, G                      // queries from t0 on (KV cache: only the new ones)
+    ldr     x9, [x9, #G_ATT_T0]
+    str     x9, [sp, #128]
+    mul     x10, x9, x5
+    sub     x19, x0, x10, lsl #2        // out, indexed by t (rows before t0 are not written)
     mov     x20, x1                     // qkv
     mov     x21, x2                     // scratch
     mov     x22, x4                     // T
@@ -1108,7 +1153,7 @@ FUNC SYM(a_attention_heads)
 att_b:
     cmp     x26, x24
     b.ge    att_done
-    mov     x27, #0                     // t
+    ldr     x27, [sp, #128]             // t from t0
 att_t:
     cmp     x27, x22
     b.ge    att_b_next
@@ -3797,6 +3842,55 @@ FUNC SYM(gpt2a_alloc_acts)
     ldp     x29, x30, [sp], #96
     ret
 
+// float* gpt2a_forward_kv(const int* tokens, long pos0, long T)
+// Batch 1 with a KV cache: runs only the T new tokens at positions pos0 .. pos0+T-1 and
+// returns their probs (T x Vp). Each layer's q, k, v rows are kept, so attention for the new
+// tokens can look at every earlier position. Earlier calls must have covered 0 .. pos0-1.
+// Generating with T = 1 costs one pass over the weights per token instead of a full
+// forward pass over the whole sequence so far.
+FUNC SYM(gpt2a_forward_kv)
+    stp     x29, x30, [sp, #-48]!
+    mov     x29, sp
+    stp     x19, x20, [sp, #16]
+    stp     x21, x22, [sp, #32]
+    mov     x19, x0
+    mov     x20, x1
+    mov     x21, x2
+    LOADADDR x22, G
+    ldr     x9, [x22, #G_PARAMS_MEM]
+    cbnz    x9, 1f
+    LOADADDR x0, s_err_init
+    b       die
+1:  add     x9, x20, x21                // pos0 + T <= maxT
+    ldr     x10, [x22, #G_MAXT]
+    cmp     x9, x10
+    b.le    2f
+    LOADADDR x0, s_err_T
+    b       die
+2:  ldr     x9, [x22, #G_KV]
+    cbnz    x9, 3f
+    ldr     x9, [x22, #G_L]             // L x maxT x 3C floats
+    mul     x9, x9, x10
+    ldr     x10, [x22, #G_C]
+    mul     x9, x9, x10
+    add     x9, x9, x9, lsl #1
+    lsl     x0, x9, #2
+    bl      xmalloc
+    str     x0, [x22, #G_KV]
+3:  mov     x9, #1
+    str     x9, [x22, #G_KV_ON]
+    str     x20, [x22, #G_KV_POS0]
+    mov     x0, x19
+    mov     x1, #1
+    mov     x2, x21
+    bl      SYM(gpt2a_forward)
+    str     xzr, [x22, #G_KV_ON]
+    str     xzr, [x22, #G_KV_POS0]
+    ldp     x19, x20, [sp, #16]
+    ldp     x21, x22, [sp, #32]
+    ldp     x29, x30, [sp], #48
+    ret
+
 // float* gpt2a_forward(const int* tokens, long B, long T)
 // Returns probs, shape (B, T, Vp), same as llm.c's acts.probs.
 FUNC SYM(gpt2a_forward)
@@ -3852,11 +3946,14 @@ FUNC SYM(gpt2a_forward)
 9:  ldr     x23, [x28, #G_C]            // C
     add     x27, x23, x23, lsl #1
     add     x27, x27, x23, lsl #2       // 7C: per-layer stats stride
-    // token + position embeddings
+    // token + position embeddings (positions from pos0 with the KV cache)
     ldr     x0, [x28, #G_ACT_X]
     mov     x1, x19
     ldr     x2, [x28, #P_WTE]
     ldr     x3, [x28, #P_WPE]
+    ldr     x9, [x28, #G_KV_POS0]
+    mul     x9, x9, x23
+    add     x3, x3, x9, lsl #2
     mov     x4, x20
     mov     x5, x21
     mov     x6, x23
@@ -3879,10 +3976,10 @@ fwd_layer:
     mov     x5, x23
     bl      playernorm
     PROFTICK x28, 1
-    // qkv = ln1 @ qkvw^T + qkvb
+    // qkv = ln1 @ qkvw^T + qkvb (with the KV cache: into this layer's cache at pos0)
     add     x26, x23, x23, lsl #1       // 3C
+    bl      fwd_qkv_rows
     mul     x9, x25, x26
-    ldr     x0, [x28, #G_ACT_QKV]
     ldr     x1, [x28, #G_ACT_LN]
     ldr     x2, [x28, #P_QKVW]
     add     x2, x2, x9, lsl #2
@@ -3896,15 +3993,20 @@ fwd_layer:
     MMHOOK  x1, x22, x23, x13
     bl      pmatmul
     PROFTICK x28, 2
-    // attention
+    // attention (with the KV cache: new queries against all cached positions)
+    bl      fwd_qkv_rows
+    ldr     x9, [x28, #G_KV_POS0]
+    mul     x10, x9, x26
+    sub     x1, x0, x10, lsl #2         // qkv rows from position 0
+    str     x9, [x28, #G_ATT_T0]
+    add     x4, x21, x9                 // T + pos0 positions
     ldr     x0, [x28, #G_ACT_ATTY]
-    ldr     x1, [x28, #G_ACT_QKV]
     ldr     x2, [x28, #G_ACT_SCRATCH]
     mov     x3, x20
-    mov     x4, x21
     mov     x5, x23
     ldr     x6, [x28, #G_NH]
     bl      pattention
+    str     xzr, [x28, #G_ATT_T0]
     PROFTICK x28, 3
     // attention projection
     mul     x9, x25, x23
@@ -4027,6 +4129,22 @@ fwd_final:
     ldr     x0, [x28, #G_ACT_PROBS]
     RESTORE_X19_X28
     ldp     x29, x30, [sp], #96
+    ret
+
+// x0 = where layer x24's q, k, v rows for this call go: G_ACT_QKV, or with the KV cache
+// G_KV + (l * maxT + pos0) * 3C floats. Uses x28 = G, x26 = 3C. Clobbers x9, x10.
+fwd_qkv_rows:
+    ldr     x9, [x28, #G_KV_ON]
+    cbnz    x9, 1f
+    ldr     x0, [x28, #G_ACT_QKV]
+    ret
+1:  ldr     x9, [x28, #G_MAXT]
+    mul     x9, x9, x24
+    ldr     x10, [x28, #G_KV_POS0]
+    add     x9, x9, x10
+    mul     x9, x9, x26
+    ldr     x0, [x28, #G_KV]
+    add     x0, x0, x9, lsl #2
     ret
 
 // ===========================================================================
@@ -4899,6 +5017,8 @@ print_token:
 // ===========================================================================
 // main: unconditional generation, like the sampling loop in llm.c.
 // Starts from <|endoftext|> and samples num_tokens - 1 tokens (default 64).
+// llm.c reruns the whole sequence for every new token; this keeps a KV cache and runs
+// only the newest token (gpt2a_forward_kv), with the same math, so the same text.
 
 #if !defined(GPT2A_NO_MAIN)
 FUNC SYM(main)
@@ -4956,20 +5076,17 @@ FUNC SYM(main)
     str     x9, [x28, #G_RNG]
     LOADADDR x0, s_generating
     bl      pr0
-    bl      SYM(clock)
-    mov     x27, x0
+    bl      now_seconds
+    fmov    x27, d0                     // start time (bits)
     mov     x26, #1                     // t
 gen_loop:
     cmp     x26, x23
     b.ge    gen_done
-    mov     x0, x25
-    mov     x1, #1
-    mov     x2, x26
-    bl      SYM(gpt2a_forward)          // B=1, T=t: probs for positions 0..t-1
-    sub     x9, x26, #1
-    ldr     x10, [x28, #G_VP]
-    mul     x9, x9, x10
-    add     x24, x0, x9, lsl #2         // probs[t-1, :]
+    sub     x1, x26, #1
+    add     x0, x25, x1, lsl #2
+    mov     x2, #1
+    bl      SYM(gpt2a_forward_kv)       // token t-1 at position t-1: probs for position t
+    mov     x24, x0
     add     x0, x28, #G_RNG
     bl      SYM(a_random_f32)           // s0 = coin
     mov     x0, x24
@@ -4988,15 +5105,14 @@ gen_loop:
     add     x26, x26, #1
     b       gen_loop
 gen_done:
-    bl      SYM(clock)
-    sub     x9, x0, x27
-    scvtf   d0, x9
-    MOV32   w9, 1000000                 // CLOCKS_PER_SEC
-    scvtf   d1, w9
-    fdiv    d0, d0, d1
+    bl      now_seconds
+    fmov    d2, x27
+    fsub    d0, d0, d2
     sub     x1, x23, #1
+    scvtf   d1, x1
+    fdiv    d1, d1, d0                  // tokens/s
     LOADADDR x0, s_timing
-    bl      pr1f
+    bl      pr1ff
     mov     w0, #0
     RESTORE_X19_X28
     ldp     x29, x30, [sp], #96

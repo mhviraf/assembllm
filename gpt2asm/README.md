@@ -17,7 +17,7 @@ The same source also builds on aarch64 Linux.
 ## What's in `gpt2_forward.S`
 
 - **Kernels:** encoder, layernorm, matmul (weights repacked at load time into 16-channel panels, 5×16 NEON register tiles), causal attention, GELU, residual and softmax. `exp` and `tanh` are vectorized and hand-written.
-- **Program:** checkpoint loader, decode-only tokenizer, xorshift sampler and the generation loop.
+- **Program:** checkpoint loader, decode-only tokenizer, xorshift sampler and the generation loop. Generation keeps a KV cache (`gpt2a_forward_kv`), so each new token costs one pass over the weights rather than a pass over the whole sequence so far.
 - **Threads:** a small pthreads pool splits the matmuls, attention, GELU and softmax across cores. Set `GPT2A_THREADS=n`; the default is all CPUs.
 - **Precision:** set `GPT2A_PRECISION` to `fp32` (the default, matches llm.c), `fp16` (2× the math per instruction, practically lossless) or `int8` (4×).
   - For int8, also set `GPT2A_CALIB=<llm.c token file>` so it can calibrate (SmoothQuant). Without that, int8 is much less accurate.

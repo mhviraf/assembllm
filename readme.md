@@ -15,7 +15,7 @@ These runs use Karpathy's real GPT-2 124M weights on Tiny Shakespeare (val split
 | **fp16** | 38 · **4.78×** | 102 · **4.00×** | +0.0001 | 2.6% |
 | **int8** (SmoothQuant) | 21 · **8.90×** | 54 · **7.62×** | +0.022 | 15% |
 
-At 4 threads that's about 340 tokens/s for llm.c versus 1,090 (fp32), 1,670 (fp16) and 3,000 (int8) for the assembly.
+At 4 threads that's about 340 tokens/s for llm.c versus 1,090 (fp32), 1,670 (fp16) and 3,000 (int8) for the assembly. These are scoring rates: one forward pass predicts all 64 positions at once. Generating text is sequential, one token per pass; see [Generating text](#generating-text).
 
 - **fp32:** 500 samples on 4 threads, 200 on 1.
 - **fp16 and int8:** 150 samples on 4 threads, 120 on 1, measured after the attention rewrite (step 12 in the log below).
@@ -43,6 +43,20 @@ These runs are native macOS on the same MacBook Air (M1), built without Xcode (s
 | int8, NEON (SmoothQuant) | 14.4 | 4,434 | 3.45× | 5.2686 |
 
 `amx16` is the fastest mode that keeps fp32's loss: int8 is about 25% faster but adds 0.017 nats.
+
+## Generating text
+
+`gpt2` samples text from `<|endoftext|>` with llm.c's RNG and prints exactly what llm.c's sampling loop prints. llm.c reruns the whole sequence for every new token, so token t costs a forward pass over t positions. The assembly keeps a KV cache instead: every layer's q, k, v rows stay in memory (about 9 MB per layer per 1,000 tokens, 113 MB for all 12 layers at the full 1,024), and each step runs only the newest token through the model (`gpt2a_forward_kv`). The math per position is unchanged, and the generated text is byte-identical.
+
+Each token then costs one pass over the weights, so generation is limited by memory bandwidth, and smaller weights help most. These numbers are for 256 tokens on 4 threads in the Linux VM:
+
+| Precision | Tokens/s | Weights read per token |
+|---|---|---|
+| fp32 | 82 | 500 MB |
+| fp16 | 142 | 250 MB |
+| int8 | 291 | 125 MB |
+
+Before the cache, 63 tokens took about 2 s of wall time in fp32 (7.7 s of CPU time across 4 threads), and each new token got slower. Now they take 0.77 s, and every token costs the same.
 
 ## Optimization log
 
@@ -134,6 +148,12 @@ The M1 has an undocumented matrix unit, AMX, next to the performance cores' shar
 17. **fp16 inputs, fp32 sums.** With bit 62 set, `fma16` multiplies 32 fp16 weights by 32 fp16 inputs into a 32 × 32 **fp32** tile. That halves the weight bytes and the load instructions, and each product is exact in fp32. Lane i of output row j lands in Z row 2j + i % 2, column i / 2. Packing each 32-channel panel in the order 0, 16, 1, 17, … makes each Z row hold 16 consecutive channels, so results store straight to memory. Unlike the NEON fp16 path, nothing is summed in fp16, and the loss matches fp32.
 
 `amx16` per-stage times (ms per pass): qkv 2.5, attention projection 0.9, MLP 3.3 + 3.6, logits 5.0, everything else 2.8. The matmuls still run about 20% slower than in isolation, where the weights stay cached.
+
+### Part 5: generation
+
+| # | Change | Effect |
+|---|---|---|
+| 18 | KV cache: `gpt2a_forward_kv` runs only the new tokens and keeps each layer's q, k, v rows. Attention starts at the first new query (`G_ATT_T0`). The generator's timer uses wall-clock time instead of `clock()`, which added up CPU time across threads. | 63 tokens: 2 s → 0.77 s (fp32, Linux VM, 4 threads), identical text. With 256 tokens: 82 tokens/s fp32, 142 fp16, 291 int8. |
 
 ## Reproduce
 
