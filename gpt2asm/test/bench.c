@@ -5,7 +5,8 @@
 // alternate who goes first, so warm-up and thermal throttling (a fanless MacBook Air) hit both equally.
 // Only the forward call itself is timed; loss and agreement checks happen outside the timers.
 //
-// Usage: bench gpt2_124M.bin tiny_shakespeare_val.bin [num_samples=1000] [T=64] [first_sample=0]
+// Usage: bench gpt2_124M.bin tiny_shakespeare_val.bin [num_samples=1000] [T=64] [first_sample=0] [asm_threads]
+// asm_threads defaults to llm.c's OpenMP thread count (1 without OpenMP).
 // (first_sample lets a long run be split into chunks; each run ends with a RAW line to add up)
 #define TESTING
 #include "train_gpt2.c"
@@ -13,6 +14,8 @@
 void gpt2a_build_from_checkpoint(const char*);
 void gpt2a_alloc_acts(long, long);
 float* gpt2a_forward(const int*, long, long);
+void gpt2a_set_threads(long);
+long gpt2a_get_threads(void);
 
 static double now(void) {
     struct timespec ts;
@@ -48,10 +51,19 @@ int main(int argc, char** argv) {
     size_t Vp = model.config.padded_vocab_size;
     int V = model.config.vocab_size;
 #ifdef OMP
-    printf("llm.c built WITH OpenMP (%d threads)\n", omp_get_max_threads());
+    int c_threads = omp_get_max_threads();
 #else
-    printf("llm.c built single-threaded; assembly is single-threaded\n");
+    int c_threads = 1;
 #endif
+    gpt2a_set_threads(argc > 6 ? atoi(argv[6]) : c_threads);
+    long a_threads = gpt2a_get_threads();
+    printf("threads: llm.c %d (%s), assembly %ld\n", c_threads,
+#ifdef OMP
+           "OpenMP",
+#else
+           "no OpenMP",
+#endif
+           a_threads);
     printf("benchmark: %d samples x %d tokens (%ld distinct windows in file)\n\n", N, T, nwin);
 
     // warm-up (also triggers llm.c's lazy activation allocation)
@@ -96,10 +108,13 @@ int main(int argc, char** argv) {
     double ntoks = (double)N * T;
     printf("\n=== results: %d samples x %d tokens, GPT-2 forward pass (%zu params) ===\n", N, T, model.num_parameters);
     printf("%-22s %10s %12s %12s %10s\n", "", "total s", "ms/sample", "tokens/s", "mean loss");
-    printf("%-22s %10.2f %12.2f %12.1f %10.4f\n", "llm.c (C, -Ofast)", t_c, 1000 * t_c / N, ntoks / t_c, loss_c / ntoks);
-    printf("%-22s %10.2f %12.2f %12.1f %10.4f\n", "assembly (ARM64)", t_a, 1000 * t_a / N, ntoks / t_a, loss_a / ntoks);
+    char lc[32], la[32];
+    snprintf(lc, 32, "llm.c, %d thread%s", c_threads, c_threads > 1 ? "s" : "");
+    snprintf(la, 32, "assembly, %ld thread%s", a_threads, a_threads > 1 ? "s" : "");
+    printf("%-22s %10.2f %12.2f %12.1f %10.4f\n", lc, t_c, 1000 * t_c / N, ntoks / t_c, loss_c / ntoks);
+    printf("%-22s %10.2f %12.2f %12.1f %10.4f\n", la, t_a, 1000 * t_a / N, ntoks / t_a, loss_a / ntoks);
     printf("assembly is %.2fx the speed of llm.c\n", t_c / t_a);
     printf("agreement: max |prob diff| %.2e, top-token mismatches %d of %.0f positions\n", maxdiff, top_mismatch, ntoks);
-    printf("RAW %d %d %.6f %.6f %.6f %.6f %.3e %d\n", N, T, t_c, t_a, loss_c, loss_a, maxdiff, top_mismatch);
+    printf("RAW %d %d %.6f %.6f %.6f %.6f %.3e %d %d %ld\n", N, T, t_c, t_a, loss_c, loss_a, maxdiff, top_mismatch, c_threads, a_threads);
     return 0;
 }

@@ -17,7 +17,8 @@ The same source also builds on aarch64 Linux.
 
 - **Kernels:** encoder, layernorm, matmul (4×4 NEON register tiles), causal attention, GELU, residual and softmax.
 - **Program:** checkpoint loader, decode-only tokenizer, xorshift sampler and the generation loop.
-- **libc use:** limited to file I/O, `malloc`, `printf`/`putchar`, `expf` and `tanhf`.
+- **Threads:** a small pthreads pool splits the matmuls, attention, GELU and softmax across cores. Set `GPT2A_THREADS=n`; the default is all CPUs.
+- **libc use:** limited to file I/O, `malloc`, `printf`/`putchar`, `expf`, `tanhf` and `pthread_create`/`pthread_join`.
 
 ## Check it against llm.c
 
@@ -34,6 +35,5 @@ This builds llm.c's `train_gpt2.c` next to the assembly and checks three things:
 ## Limits
 
 - Forward pass only; there's no training.
-- Single-threaded.
 - Like llm.c, it recomputes the whole sequence for every new token (no KV cache).
 - Generation starts from `<|endoftext|>` with no prompt, because llm.c's tokenizer only decodes.

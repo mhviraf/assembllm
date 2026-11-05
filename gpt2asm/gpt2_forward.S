@@ -9,7 +9,14 @@
 //     ./gpt2 [gpt2_124M.bin] [gpt2_tokenizer.bin] [num_tokens]
 //
 // Only libc is used: fopen/fread/fclose, malloc, printf/putchar/fflush,
-// atoi, clock, exit, and expf/tanhf. Everything else is written by hand.
+// atoi, getenv, sysconf, clock, exit, expf/tanhf, and pthread_create/join.
+// Everything else is written by hand.
+//
+// Threads: the matmuls, attention, GELU and softmax are split across a small
+// thread pool (GPT2A_THREADS=n, default: all CPUs). Workers are started at the
+// beginning of each forward pass and joined at the end, so nothing spins between
+// passes. Work is handed out with a generation counter and a done counter
+// (load-acquire / store-release and an exclusive-monitor increment).
 //
 // Calling convention: standard AAPCS64. x18 is never touched (reserved on
 // Apple). Varargs for printf go through helpers that put the arguments both
@@ -111,7 +118,14 @@
 .equ G_PSIZES,      304      // 16 tensor sizes (floats)
 .equ G_HEADER,      432      // 256 x int32 file header
 .equ G_BYTE,        1456     // 1-byte read buffer
-.equ G_SIZE,        1472
+.equ G_POOL_GEN,    1536     // work generation counter (own cache line)
+.equ G_POOL_DONE,   1600     // workers finished this generation (own cache line)
+.equ G_NTHREADS,    1664     // threads used by the forward pass (0 = not chosen yet)
+.equ G_POOL_FN,     1672     // part function for the current generation (0 = exit)
+.equ G_TASK,        1680     // up to 8 arguments for the part function
+.equ G_TIDS,        1744     // pthread_t of each worker (64 x 8 bytes)
+.equ G_SIZE,        2304
+.equ MAX_THREADS,   64
 
 // parameter tensor slots (offsets into G_PARAMS), llm.c order
 .equ P_WTE,      (G_PARAMS + 0)
@@ -135,7 +149,7 @@
 // data
 
     .data
-    .p2align 4
+    .p2align 6
 G:  .space G_SIZE
 
 s_rb:            .asciz "rb"
@@ -167,6 +181,9 @@ s_err_cap:       .asciz "Error: B*T is larger than the allocated activations\n"
 s_err_tok:       .asciz "Error: input token out of range [0, vocab_size)\n"
 s_warn_tok:      .asciz "WARNING: could not open tokenizer file %s, printing token ids instead\n"
 s_invalid_tok:   .asciz "invalid token id %ld!\n"
+s_env_threads:   .asciz "GPT2A_THREADS"
+s_threads:       .asciz "threads: %ld\n"
+s_err_thread:    .asciz "Error: pthread_create failed\n"
 
 // ===========================================================================
 // small helpers
@@ -416,9 +433,17 @@ ln_done:
 // void a_matmul_forward(float* out, const float* inp, const float* weight,
 //                       const float* bias, long N, long C, long OC)
 // out[n,o] = bias[o] + sum_i inp[n,i] * weight[o,i]     (bias may be NULL)
+FUNC SYM(a_matmul_forward)
+    mov     x7, x6
+    b       SYM(a_matmul_strided)
+
+// void a_matmul_strided(float* out, const float* inp, const float* weight,
+//                       const float* bias, long N, long C, long OC, long ldo)
+// Same as above for OC output channels, but output rows are ldo floats apart,
+// so a thread can compute a slice of the output channels in place.
 // Main path: 4 rows x 4 output channels per tile, 16 vector accumulators.
 // Leftover rows/channels (or C not a multiple of 4) use a single dot product.
-FUNC SYM(a_matmul_forward)
+FUNC SYM(a_matmul_strided)
     stp     x29, x30, [sp, #-96]!
     mov     x29, sp
     SAVE_X19_X28
@@ -428,29 +453,33 @@ FUNC SYM(a_matmul_forward)
     mov     x22, x3                     // bias
     mov     x23, x4                     // N
     mov     x24, x5                     // C
-    mov     x25, x6                     // OC
+    mov     x25, x6                     // OC (channels computed here)
+    mov     x16, x7                     // ldo (output row stride, floats)
     lsl     x26, x24, #2                // row bytes
+    // Loop order: blocks of 4 output channels outside, blocks of 4 rows inside.
+    // The 4 weight rows of a block stay in L1 while every input row streams
+    // past them, so each weight is read from memory once per call.
+    lsr     x14, x23, #2
+    lsl     x14, x14, #2                // N4 = rows in full 4-row blocks
+    lsr     x15, x25, #2
+    lsl     x15, x15, #2                // OC4 = channels in full 4-channel blocks
+    tst     x24, #3                     // tiles need C % 4 == 0
+    b.eq    1f
+    mov     x14, #0
+    mov     x15, #0
+1:  mov     x28, #0                     // o
+mm_oblk:
+    cmp     x28, x15
+    b.ge    mm_otail
     mov     x27, #0                     // r
-    tst     x24, #3
-    b.ne    mm_rows1
-mm_rows4:
-    add     x9, x27, #4
-    cmp     x9, x23
-    b.gt    mm_rows1
+mm_rblk:
+    cmp     x27, x14
+    b.ge    mm_rtail
     mul     x9, x27, x26
-    add     x12, x20, x9                // input rows r .. r+3
-    add     x13, x12, x26
-    add     x14, x13, x26
-    add     x15, x14, x26
-    mov     x28, #0                     // o
-mm_cols4:
-    add     x9, x28, #4
-    cmp     x9, x25
-    b.gt    mm_cols1
-    mov     x0, x12
-    mov     x1, x13
-    mov     x2, x14
-    mov     x3, x15
+    add     x0, x20, x9                 // input rows r .. r+3
+    add     x1, x0, x26
+    add     x2, x1, x26
+    add     x3, x2, x26
     mul     x9, x28, x26
     add     x4, x21, x9                 // weight rows o .. o+3
     add     x5, x4, x26
@@ -473,7 +502,7 @@ mm_cols4:
     movi    v30.16b, #0
     movi    v31.16b, #0
     mov     x8, x24
-1:  ld1     {v0.4s}, [x0], #16
+2:  ld1     {v0.4s}, [x0], #16
     ld1     {v1.4s}, [x1], #16
     ld1     {v2.4s}, [x2], #16
     ld1     {v3.4s}, [x3], #16
@@ -498,7 +527,7 @@ mm_cols4:
     fmla    v30.4s, v3.4s, v6.4s
     fmla    v31.4s, v3.4s, v7.4s
     subs    x8, x8, #4
-    b.gt    1b
+    b.gt    2b
     // horizontal sums: each row ends up as one vector [o, o+1, o+2, o+3]
     faddp   v16.4s, v16.4s, v17.4s
     faddp   v18.4s, v18.4s, v19.4s
@@ -512,17 +541,17 @@ mm_cols4:
     faddp   v28.4s, v28.4s, v29.4s
     faddp   v30.4s, v30.4s, v31.4s
     faddp   v28.4s, v28.4s, v30.4s
-    cbz     x22, 2f
+    cbz     x22, 3f
     add     x9, x22, x28, lsl #2
     ld1     {v0.4s}, [x9]
     fadd    v16.4s, v16.4s, v0.4s
     fadd    v20.4s, v20.4s, v0.4s
     fadd    v24.4s, v24.4s, v0.4s
     fadd    v28.4s, v28.4s, v0.4s
-2:  mul     x9, x27, x25
+3:  mul     x9, x27, x16
     add     x9, x9, x28
     add     x9, x19, x9, lsl #2
-    lsl     x10, x25, #2
+    lsl     x10, x16, #2
     st1     {v16.4s}, [x9]
     add     x9, x9, x10
     st1     {v20.4s}, [x9]
@@ -530,50 +559,56 @@ mm_cols4:
     st1     {v24.4s}, [x9]
     add     x9, x9, x10
     st1     {v28.4s}, [x9]
-    add     x28, x28, #4
-    b       mm_cols4
-mm_cols1:                               // leftover output channels for rows r..r+3
-    cmp     x28, x25
-    b.ge    mm_rows4_next
-    mov     x0, x12
-    mov     x1, x27
-    bl      mm_one
-    mov     x0, x13
-    add     x1, x27, #1
-    bl      mm_one
-    mov     x0, x14
-    add     x1, x27, #2
-    bl      mm_one
-    mov     x0, x15
-    add     x1, x27, #3
-    bl      mm_one
-    add     x28, x28, #1
-    b       mm_cols1
-mm_rows4_next:
     add     x27, x27, #4
-    b       mm_rows4
-mm_rows1:                               // leftover rows, one output at a time
+    b       mm_rblk
+mm_rtail:                               // leftover rows, channels o .. o+3
     cmp     x27, x23
-    b.ge    mm_done
+    b.ge    mm_oblk_next
+    mov     x12, x28
     mul     x9, x27, x26
-    add     x12, x20, x9
-    mov     x28, #0
-3:  cmp     x28, x25
-    b.ge    4f
-    mov     x0, x12
+    add     x13, x20, x9                // input row r
+    mov     x0, x13
     mov     x1, x27
     bl      mm_one
     add     x28, x28, #1
-    b       3b
-4:  add     x27, x27, #1
-    b       mm_rows1
+    mov     x0, x13
+    mov     x1, x27
+    bl      mm_one
+    add     x28, x28, #1
+    mov     x0, x13
+    mov     x1, x27
+    bl      mm_one
+    add     x28, x28, #1
+    mov     x0, x13
+    mov     x1, x27
+    bl      mm_one
+    mov     x28, x12
+    add     x27, x27, #1
+    b       mm_rtail
+mm_oblk_next:
+    add     x28, x28, #4
+    b       mm_oblk
+mm_otail:                               // leftover channels, every row
+    cmp     x28, x25
+    b.ge    mm_done
+    mov     x27, #0
+4:  cmp     x27, x23
+    b.ge    5f
+    mul     x9, x27, x26
+    add     x0, x20, x9
+    mov     x1, x27
+    bl      mm_one
+    add     x27, x27, #1
+    b       4b
+5:  add     x28, x28, #1
+    b       mm_otail
 mm_done:
     RESTORE_X19_X28
     ldp     x29, x30, [sp], #96
     ret
 
 // mm_one: out[x1, o] = bias[o] + dot(x0, weight[o]), o = x28.
-// Uses a_matmul_forward's registers x19, x21, x22, x24, x25, x26, x28.
+// Uses a_matmul_strided's registers x16, x19, x21, x22, x24, x26, x28.
     .p2align 4
 mm_one:
     stp     x29, x30, [sp, #-16]!
@@ -586,7 +621,7 @@ mm_one:
     cbz     x22, 1f
     ldr     s1, [x22, x28, lsl #2]
     fadd    s0, s0, s1
-1:  mul     x9, x1, x25
+1:  mul     x9, x1, x16
     add     x9, x9, x28
     str     s0, [x19, x9, lsl #2]
     ldp     x29, x30, [sp], #16
@@ -597,12 +632,20 @@ mm_one:
 // qkv is (B,T,3C) holding q, k, v. out is (B,T,C). Causal softmax attention.
 // scratch holds one row of attention weights (at least T floats).
 FUNC SYM(a_attention_forward)
+    lsl     x7, x6, #32                 // heads [0, NH)
+    b       SYM(a_attention_heads)
+
+// void a_attention_heads(float* out, const float* qkv, float* scratch,
+//                        long B, long T, long C, long NH, long h0 | (h1 << 32))
+// Attention for heads h0 .. h1-1 only (one thread's share).
+FUNC SYM(a_attention_heads)
     stp     x29, x30, [sp, #-160]!
     mov     x29, sp
     SAVE_X19_X28
     stp     d8, d9, [sp, #96]
     stp     d10, d11, [sp, #112]
-    // locals: [sp, #128] exp-loop pointer, [sp, #136] exp-loop end
+    // locals: [sp, #128] exp-loop pointer, [sp, #136] exp-loop end,
+    //         [sp, #144] first head offset, [sp, #152] end head offset
     mov     x19, x0                     // out
     mov     x20, x1                     // qkv
     mov     x21, x2                     // scratch
@@ -610,6 +653,12 @@ FUNC SYM(a_attention_forward)
     mov     x23, x5                     // C
     mul     x24, x3, x4                 // B*T
     sdiv    x25, x5, x6                 // hs = C / NH
+    mov     w9, w7
+    mul     x9, x9, x25
+    str     x9, [sp, #144]              // h0 * hs
+    lsr     x9, x7, #32
+    mul     x9, x9, x25
+    str     x9, [sp, #152]              // h1 * hs
     // scale = 1.0 / sqrtf(hs), float sqrt then double divide, like the C code
     scvtf   s0, x25
     fsqrt   s0, s0
@@ -625,9 +674,10 @@ att_b:
 att_t:
     cmp     x27, x22
     b.ge    att_b_next
-    mov     x28, #0                     // h*hs
+    ldr     x28, [sp, #144]             // h*hs
 att_h:
-    cmp     x28, x23
+    ldr     x9, [sp, #152]
+    cmp     x28, x9
     b.ge    att_t_next
     // pass 1: score[t2] = (q . k_t2) * scale, track the max
     FLOADK  s9, w9, F_NEG10000
@@ -1069,7 +1119,7 @@ FUNC SYM(gpt2a_alloc_acts)
     bl      xmalloc
     str     x0, [x19, #G_ACT_PROBS]
     ldr     x0, [x19, #G_MAXT]
-    lsl     x0, x0, #2
+    lsl     x0, x0, #8                  // maxT floats for each of 64 threads
     bl      xmalloc
     str     x0, [x19, #G_ACT_SCRATCH]
     RESTORE_X19_X28
@@ -1119,7 +1169,9 @@ FUNC SYM(gpt2a_forward)
     b       5b
 6:  LOADADDR x0, s_err_tok
     b       die
-7:  ldr     x23, [x28, #G_C]            // C
+7:  bl      threads_init
+    bl      pool_start
+    ldr     x23, [x28, #G_C]            // C
     // token + position embeddings
     ldr     x0, [x28, #G_ACT_X]
     mov     x1, x19
@@ -1158,7 +1210,7 @@ fwd_layer:
     mov     x4, x22
     mov     x5, x23
     mov     x6, x26
-    bl      SYM(a_matmul_forward)
+    bl      pmatmul
     // attention
     ldr     x0, [x28, #G_ACT_ATTY]
     ldr     x1, [x28, #G_ACT_QKV]
@@ -1167,7 +1219,7 @@ fwd_layer:
     mov     x4, x21
     mov     x5, x23
     ldr     x6, [x28, #G_NH]
-    bl      SYM(a_attention_forward)
+    bl      pattention
     // attention projection
     mul     x9, x25, x23
     ldr     x0, [x28, #G_ACT_PROJ]
@@ -1179,7 +1231,7 @@ fwd_layer:
     mov     x4, x22
     mov     x5, x23
     mov     x6, x23
-    bl      SYM(a_matmul_forward)
+    bl      pmatmul
     // residual
     ldr     x0, [x28, #G_ACT_X]
     mov     x1, x0
@@ -1209,12 +1261,12 @@ fwd_layer:
     mov     x4, x22
     mov     x5, x23
     mov     x6, x26
-    bl      SYM(a_matmul_forward)
+    bl      pmatmul
     // gelu, in place
     ldr     x0, [x28, #G_ACT_FCH]
     mov     x1, x0
     mul     x2, x22, x26
-    bl      SYM(a_gelu_forward)
+    bl      pgelu
     // MLP down
     mul     x9, x25, x26
     ldr     x0, [x28, #G_ACT_PROJ]
@@ -1226,7 +1278,7 @@ fwd_layer:
     mov     x4, x22
     mov     x5, x26
     mov     x6, x23
-    bl      SYM(a_matmul_forward)
+    bl      pmatmul
     // residual
     ldr     x0, [x28, #G_ACT_X]
     mov     x1, x0
@@ -1252,18 +1304,354 @@ fwd_final:
     mov     x4, x22
     mov     x5, x23
     ldr     x6, [x28, #G_VP]
-    bl      SYM(a_matmul_forward)
+    bl      pmatmul
     // softmax, in place
     ldr     x0, [x28, #G_ACT_PROBS]
     mov     x1, x0
     mov     x2, x22
     ldr     x3, [x28, #G_V]
     ldr     x4, [x28, #G_VP]
-    bl      SYM(a_softmax_forward)
+    bl      psoftmax
+    bl      pool_stop
     ldr     x0, [x28, #G_ACT_PROBS]
     RESTORE_X19_X28
     ldp     x29, x30, [sp], #96
     ret
+
+// ===========================================================================
+// threads
+
+// threads_init: choose the thread count once (GPT2A_THREADS, else all online CPUs)
+    .p2align 4
+threads_init:
+    stp     x29, x30, [sp, #-16]!
+    mov     x29, sp
+    LOADADDR x9, G
+    ldr     x10, [x9, #G_NTHREADS]
+    cbnz    x10, 3f
+    LOADADDR x0, s_env_threads
+    bl      SYM(getenv)
+    cbz     x0, 1f
+    bl      SYM(atoi)
+    sxtw    x0, w0
+    cmp     x0, #0
+    b.gt    2f
+1:
+#if defined(__APPLE__)
+    mov     x0, #58                     // _SC_NPROCESSORS_ONLN on macOS
+#else
+    mov     x0, #84                     // _SC_NPROCESSORS_ONLN on Linux
+#endif
+    bl      SYM(sysconf)
+2:  bl      clamp_threads
+    LOADADDR x9, G
+    str     x0, [x9, #G_NTHREADS]
+3:  ldp     x29, x30, [sp], #16
+    ret
+
+// x0 -> clamp(x0, 1, MAX_THREADS)
+    .p2align 4
+clamp_threads:
+    cmp     x0, #1
+    b.ge    1f
+    mov     x0, #1
+1:  cmp     x0, #MAX_THREADS
+    b.le    2f
+    mov     x0, #MAX_THREADS
+2:  ret
+
+// void gpt2a_set_threads(long n)
+FUNC SYM(gpt2a_set_threads)
+    stp     x29, x30, [sp, #-16]!
+    mov     x29, sp
+    bl      clamp_threads
+    LOADADDR x9, G
+    str     x0, [x9, #G_NTHREADS]
+    ldp     x29, x30, [sp], #16
+    ret
+
+// long gpt2a_get_threads(void)
+FUNC SYM(gpt2a_get_threads)
+    stp     x29, x30, [sp, #-16]!
+    mov     x29, sp
+    bl      threads_init
+    LOADADDR x9, G
+    ldr     x0, [x9, #G_NTHREADS]
+    ldp     x29, x30, [sp], #16
+    ret
+
+// pool_start: create workers 1 .. n-1 (thread 0 is the caller)
+    .p2align 4
+pool_start:
+    stp     x29, x30, [sp, #-32]!
+    mov     x29, sp
+    stp     x19, x20, [sp, #16]
+    LOADADDR x19, G
+    str     xzr, [x19, #G_POOL_GEN]
+    str     xzr, [x19, #G_POOL_DONE]
+    mov     x20, #1
+1:  ldr     x9, [x19, #G_NTHREADS]
+    cmp     x20, x9
+    b.ge    3f
+    add     x0, x19, #G_TIDS
+    add     x0, x0, x20, lsl #3         // &tids[i]
+    mov     x1, #0
+    LOADADDR x2, worker_main
+    mov     x3, x20                     // worker id
+    bl      SYM(pthread_create)
+    cbz     w0, 2f
+    LOADADDR x0, s_err_thread
+    b       die
+2:  add     x20, x20, #1
+    b       1b
+3:  ldp     x19, x20, [sp, #16]
+    ldp     x29, x30, [sp], #32
+    ret
+
+// pool_stop: tell the workers to exit (fn = 0, new generation) and join them
+    .p2align 4
+pool_stop:
+    stp     x29, x30, [sp, #-32]!
+    mov     x29, sp
+    stp     x19, x20, [sp, #16]
+    LOADADDR x19, G
+    ldr     x9, [x19, #G_NTHREADS]
+    cmp     x9, #1
+    b.le    3f
+    str     xzr, [x19, #G_POOL_FN]
+    add     x10, x19, #G_POOL_GEN
+    ldr     x11, [x10]
+    add     x11, x11, #1
+    stlr    x11, [x10]                  // release: fn = 0 is visible first
+    mov     x20, #1
+1:  ldr     x9, [x19, #G_NTHREADS]
+    cmp     x20, x9
+    b.ge    3f
+    add     x9, x19, #G_TIDS
+    ldr     x0, [x9, x20, lsl #3]
+    mov     x1, #0
+    bl      SYM(pthread_join)
+    add     x20, x20, #1
+    b       1b
+3:  ldp     x19, x20, [sp, #16]
+    ldp     x29, x30, [sp], #32
+    ret
+
+// worker_main(id): wait for a new generation, run fn(id), count it as done
+    .p2align 4
+worker_main:
+    stp     x29, x30, [sp, #-48]!
+    mov     x29, sp
+    stp     x19, x20, [sp, #16]
+    stp     x21, x22, [sp, #32]
+    mov     x19, x0                     // id
+    LOADADDR x20, G
+    mov     x21, #0                     // last generation seen
+1:  add     x10, x20, #G_POOL_GEN
+2:  ldar    x9, [x10]                   // acquire: task and fn are visible
+    cmp     x9, x21
+    b.ne    3f
+    yield
+    b       2b
+3:  mov     x21, x9
+    ldr     x9, [x20, #G_POOL_FN]
+    cbz     x9, 9f
+    mov     x0, x19
+    blr     x9
+    add     x10, x20, #G_POOL_DONE
+4:  ldxr    x11, [x10]
+    add     x11, x11, #1
+    stlxr   w12, x11, [x10]             // release: our outputs are visible first
+    cbnz    w12, 4b
+    b       1b
+9:  mov     x0, #0
+    ldp     x19, x20, [sp, #16]
+    ldp     x21, x22, [sp, #32]
+    ldp     x29, x30, [sp], #48
+    ret
+
+// pool_run(fn): run fn(0) here and fn(1..n-1) on the workers, wait for all
+    .p2align 4
+pool_run:
+    stp     x29, x30, [sp, #-32]!
+    mov     x29, sp
+    stp     x19, x20, [sp, #16]
+    LOADADDR x19, G
+    mov     x20, x0
+    ldr     x9, [x19, #G_NTHREADS]
+    cmp     x9, #1
+    b.le    2f
+    str     x20, [x19, #G_POOL_FN]
+    str     xzr, [x19, #G_POOL_DONE]
+    add     x10, x19, #G_POOL_GEN
+    ldr     x11, [x10]
+    add     x11, x11, #1
+    stlr    x11, [x10]                  // release: fn, task, done = 0 visible first
+2:  mov     x0, #0
+    blr     x20
+    ldr     x9, [x19, #G_NTHREADS]
+    cmp     x9, #1
+    b.le    4f
+    sub     x9, x9, #1
+    add     x10, x19, #G_POOL_DONE
+3:  ldar    x11, [x10]                  // acquire: worker outputs are visible
+    cmp     x11, x9
+    b.eq    4f
+    yield
+    b       3b
+4:  ldp     x19, x20, [sp, #16]
+    ldp     x29, x30, [sp], #32
+    ret
+
+// store x0..x6 as the task arguments
+.macro SET_TASK
+    LOADADDR x9, G
+    add     x9, x9, #G_TASK
+    stp     x0, x1, [x9]
+    stp     x2, x3, [x9, #16]
+    stp     x4, x5, [x9, #32]
+    str     x6, [x9, #48]
+.endm
+
+// parallel wrappers, same arguments as the single-threaded kernels
+    .p2align 4
+pmatmul:                                // (out, inp, weight, bias, N, C, OC)
+    SET_TASK
+    LOADADDR x0, par_matmul
+    b       pool_run
+    .p2align 4
+pattention:                             // (out, qkv, scratch, B, T, C, NH)
+    SET_TASK
+    LOADADDR x0, par_attention
+    b       pool_run
+    .p2align 4
+pgelu:                                  // (out, inp, N)
+    SET_TASK
+    LOADADDR x0, par_gelu
+    b       pool_run
+    .p2align 4
+psoftmax:                               // (probs, logits, N, V, Vp)
+    SET_TASK
+    LOADADDR x0, par_softmax
+    b       pool_run
+
+// part functions: x0 = part index. Each computes its slice, then tail-calls the kernel.
+
+// matmul: output channels split in chunks of 16 (64 bytes)
+    .p2align 4
+par_matmul:
+    LOADADDR x9, G
+    ldr     x10, [x9, #G_NTHREADS]
+    add     x15, x9, #G_TASK
+    ldr     x11, [x15, #48]             // OC
+    add     x12, x11, x10
+    sub     x12, x12, #1
+    udiv    x12, x12, x10               // ceil(OC / n)
+    add     x12, x12, #15
+    lsr     x12, x12, #4
+    lsl     x12, x12, #4                // rounded up to 16
+    mul     x13, x0, x12                // oA
+    cmp     x13, x11
+    b.ge    9f
+    add     x14, x13, x12
+    cmp     x14, x11
+    csel    x14, x11, x14, gt           // oB
+    ldr     x5, [x15, #40]              // C
+    ldr     x0, [x15, #0]
+    add     x0, x0, x13, lsl #2         // out + oA
+    ldr     x1, [x15, #8]               // inp
+    ldr     x2, [x15, #16]
+    mul     x9, x13, x5
+    add     x2, x2, x9, lsl #2          // weight + oA*C
+    ldr     x3, [x15, #24]
+    cbz     x3, 1f
+    add     x3, x3, x13, lsl #2         // bias + oA
+1:  ldr     x4, [x15, #32]              // N
+    sub     x6, x14, x13                // channels in this slice
+    mov     x7, x11                     // ldo = OC
+    b       SYM(a_matmul_strided)
+9:  ret
+
+// attention: heads split evenly, one scratch row per part
+    .p2align 4
+par_attention:
+    LOADADDR x9, G
+    ldr     x10, [x9, #G_NTHREADS]
+    ldr     x8, [x9, #G_MAXT]
+    add     x15, x9, #G_TASK
+    ldr     x6, [x15, #48]              // NH
+    add     x12, x6, x10
+    sub     x12, x12, #1
+    udiv    x12, x12, x10               // heads per part
+    mul     x13, x0, x12                // h0
+    cmp     x13, x6
+    b.ge    9f
+    add     x14, x13, x12
+    cmp     x14, x6
+    csel    x14, x6, x14, gt            // h1
+    mul     x9, x0, x8
+    ldr     x2, [x15, #16]
+    add     x2, x2, x9, lsl #2          // scratch + part*maxT
+    ldr     x0, [x15, #0]
+    ldr     x1, [x15, #8]
+    ldr     x3, [x15, #24]
+    ldr     x4, [x15, #32]
+    ldr     x5, [x15, #40]
+    orr     x7, x13, x14, lsl #32
+    b       SYM(a_attention_heads)
+9:  ret
+
+// gelu: elements split in chunks of 4
+    .p2align 4
+par_gelu:
+    LOADADDR x9, G
+    ldr     x10, [x9, #G_NTHREADS]
+    add     x15, x9, #G_TASK
+    ldr     x11, [x15, #16]             // N
+    add     x12, x11, x10
+    sub     x12, x12, #1
+    udiv    x12, x12, x10
+    add     x12, x12, #3
+    lsr     x12, x12, #2
+    lsl     x12, x12, #2
+    mul     x13, x0, x12                // start
+    cmp     x13, x11
+    b.ge    9f
+    sub     x2, x11, x13
+    cmp     x2, x12
+    csel    x2, x12, x2, gt             // count
+    ldr     x0, [x15, #0]
+    add     x0, x0, x13, lsl #2
+    ldr     x1, [x15, #8]
+    add     x1, x1, x13, lsl #2
+    b       SYM(a_gelu_forward)
+9:  ret
+
+// softmax: rows split evenly
+    .p2align 4
+par_softmax:
+    LOADADDR x9, G
+    ldr     x10, [x9, #G_NTHREADS]
+    add     x15, x9, #G_TASK
+    ldr     x11, [x15, #16]             // N rows
+    add     x12, x11, x10
+    sub     x12, x12, #1
+    udiv    x12, x12, x10
+    mul     x13, x0, x12                // first row
+    cmp     x13, x11
+    b.ge    9f
+    sub     x2, x11, x13
+    cmp     x2, x12
+    csel    x2, x12, x2, gt             // rows here
+    ldr     x3, [x15, #24]              // V
+    ldr     x4, [x15, #32]              // Vp
+    mul     x9, x13, x4
+    ldr     x0, [x15, #0]
+    add     x0, x0, x9, lsl #2
+    ldr     x1, [x15, #8]
+    add     x1, x1, x9, lsl #2
+    b       SYM(a_softmax_forward)
+9:  ret
 
 // ===========================================================================
 // sampler (llm.c: xorshift64* rng, sample from the cumulative distribution)
@@ -1466,6 +1854,10 @@ FUNC SYM(main)
     mov     x9, #2
     cmp     x23, #2
     csel    x23, x9, x23, lt
+    bl      SYM(gpt2a_get_threads)
+    mov     x1, x0
+    LOADADDR x0, s_threads
+    bl      pr1
     mov     x0, x22
     bl      SYM(gpt2a_tokenizer_init)
     ldr     x9, [x28, #G_TOK_OK]
