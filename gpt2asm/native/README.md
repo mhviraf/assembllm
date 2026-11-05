@@ -11,6 +11,7 @@ Both accept these settings:
 - `GPT2A_PROFILE=1`: per-stage timing.
 - `GPT2A_AMX_THREADS`: how many threads issue AMX matmuls (default: all).
 - `GPT2A_AMX_PF`: how far ahead, in bytes, the CPU prefetches each AMX kernel's weights (default 8192).
+- `GPT2A_AMX_MIX=25`: with `amx16`, each thread computes that percent of its channels with NEON while it feeds AMX. About 10% faster, at +0.002 loss; off by default.
 - `GPT2A_AMX_E=n`, `GPT2A_AMX_ESHARE=%`, `GPT2A_AMX_EQOS`: experimental. These add n threads on the efficiency cores that take that share of each AMX matmul. It's slower in practice; see step 19 in the top-level readme.
 
 On macOS the default thread count is the number of performance cores, and all threads run at user-interactive QoS so they stay on those cores. If macOS refuses to start a binary that was copied over, run `xattr -c <binary>`.

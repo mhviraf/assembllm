@@ -27,6 +27,8 @@ void loop_f16(long, uint64_t, uint64_t);
 void loop_h32(long, const void*, const void*, uint64_t);
 void loop_v2(long, const void*, const void*);
 void loop_pair(long, const void*, const void*, uint64_t);
+void loop_neon(long);
+void loop_mix(long, const void*, const void*, uint64_t);
 
 #define PTR(p)   ((uint64_t)(uintptr_t)(p))
 #define REG(r)   ((uint64_t)(r) << 56)
@@ -213,7 +215,9 @@ static void* worker(void* p) {
     else if (j->kind == 1) loop_f16(j->n, j->a, j->a);
     else if (j->kind == 2) loop_h32(j->n, j->xb, j->yb, j->a);
     else if (j->kind == 3) loop_v2(j->n, j->xb, j->yb);
-    else loop_pair(j->n, j->xb, j->yb, j->a);
+    else if (j->kind == 4) loop_pair(j->n, j->xb, j->yb, j->a);
+    else if (j->kind == 5) loop_neon(j->n);
+    else loop_mix(j->n, j->xb, j->yb, j->a);
     j->secs = now() - t0;
     amx_clr();
     return 0;
@@ -257,9 +261,33 @@ static void c_ecores(int mode) {                         // mode: 0..2 = 1/2/4 E
     else printf("ldx + ldy + fma16 fp32 sums: %d E thread%s %6.0f GFLOP/s\n", ne, ne > 1 ? "s" : " ", 2.0 * 1024 * n * ne / we / 1e9);
 }
 
+// --- 7. overlap: 4 performance-core threads, each feeding AMX (fp16 kernel step: 1,024 MACs
+// per iteration) and/or doing 16 sdot (256 int8 MACs) per iteration
+static void c_overlap(int kind) {                        // 2: AMX only, 5: NEON only, 6: both
+    long n = 20000000;
+    pthread_t th[4]; struct job jobs[4];
+    for (int i = 0; i < 4; i++) {
+        jobs[i] = (struct job){kind, n, B62, 0, bufs[i], bufs[i] + 8192, 0x21};
+        pthread_create(&th[i], 0, worker, &jobs[i]);
+    }
+    double w = 0;
+    for (int i = 0; i < 4; i++) { pthread_join(th[i], 0); if (jobs[i].secs > w) w = jobs[i].secs; }
+    double ns = w / n * 1e9;
+    printf("%-36s %6.2f ns per iteration: AMX %5.0f GFLOP/s, NEON int8 %5.0f GOPS\n",
+           kind == 2 ? "AMX step only" : kind == 5 ? "16 sdot only" : "AMX step + 16 sdot interleaved", ns,
+           kind == 5 ? 0.0 : 2.0 * 1024 * n * 4 / w / 1e9, kind == 2 ? 0.0 : 2.0 * 256 * n * 4 / w / 1e9);
+}
+
 int main(int argc, char** argv) {
     char cpu[128] = {0}; unsigned long len = sizeof cpu;
     if (sysctlbyname("machdep.cpu.brand_string", cpu, &len, 0, 0) == 0) printf("%s\n", cpu);
+    if (argc > 1 && strcmp(argv[1], "overlap") == 0) {
+        printf("== 7. NEON next to AMX (4 threads)\n");
+        run(c_overlap, 2);
+        run(c_overlap, 5);
+        run(c_overlap, 6);
+        return 0;
+    }
     if (argc > 1 && strcmp(argv[1], "ecores") == 0) {
         printf("== 6. efficiency-core AMX (background QoS)\n");
         for (int m = 0; m < 4; m++) run(c_ecores, m);

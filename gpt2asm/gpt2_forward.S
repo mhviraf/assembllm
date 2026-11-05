@@ -497,6 +497,7 @@
 .equ G_NTOTAL,      2728     // pool threads this forward pass: G_NTHREADS + G_NE
 .equ G_POOL_PARTS,  2736     // parts in the current pool generation
 .equ G_EQOS,        2744     // QoS class of the E-core helpers (GPT2A_AMX_EQOS, default 0x11 utility)
+.equ G_MIX,         2752     // amx16: percent of each thread's channels done on NEON alongside AMX
 .equ G_SIZE,        2816
 .equ NPROF,         12
 .equ KC16,          64       // fp16 accumulation block before folding into fp32
@@ -607,6 +608,7 @@ s_env_amxpf:     .asciz "GPT2A_AMX_PF"
 s_env_amxe:      .asciz "GPT2A_AMX_E"
 s_env_amxes:     .asciz "GPT2A_AMX_ESHARE"
 s_env_amxeq:     .asciz "GPT2A_AMX_EQOS"
+s_env_amxmix:    .asciz "GPT2A_AMX_MIX"
 s_amx32:         .asciz "amx kernel: 32 x 32 tiles\n"
 s_amx16:         .asciz "amx kernel: 16 x 64 tiles\n"
 s_amxr0:         .asciz "amx kernel: 16 x 64 tiles, X0 / Y0 only\n"
@@ -3096,6 +3098,302 @@ FUNC SYM(a_transpose64_s)
     b       1b
 9:  ret
 
+#if defined(__APPLE__) || defined(AMX_NOP_TEST)
+#if !defined(__APPLE__)
+// Linux test build of the fused kernel: AMX instructions become nops, so only the NEON
+// half computes anything (amx/README.md: tested under qemu this way)
+.purgem AMXOP
+.purgem AMX_SET
+.purgem AMX_CLR
+.macro AMXOP op, reg
+    nop
+.endm
+.macro AMX_SET
+    nop
+.endm
+.macro AMX_CLR
+    nop
+.endm
+#endif
+// ---------------------------------------------------------------------------
+// a_matmul_amxh_mix: AMX and NEON in one instruction stream.
+// void a_matmul_amxh_mix(float* out, const uint16_t* xT16, const uint16_t* wp16,
+//                        const float* bias, long n, long C, long W, long ldo)
+// Channels [0, W - Wn) go through AMX exactly as in a_matmul_amxh, while the same thread
+// computes channels [W - Wn, W) with NEON fp16 FMLA: tiles of 6 rows x 32 channels read
+// straight from the transposed fp16 input (8 rows per load) and from the same interleaved
+// panels, fp16 sums folded into fp32 every 64 k. Two NEON k steps ride along with every AMX
+// k step: while 4 threads take turns on the one AMX unit, each core has cycles to spare.
+// Wn = W * G_MIX / 100, rounded down to 32. Needs C % 64 == 0, W % 32 == 0, n <= 64.
+// Registers: AMX loop x0 x1 x2 x4 x6 x7 x12; NEON state x3 (input) x8 (weights) x13 (channel)
+// x14 (row block) x15 (k) x16 (active); temps x5 x9 x10 x11 x17; v0 input, v1-v4 weights,
+// v8-v31 the 6 x 4 accumulators.
+.macro NSTEP
+    ld1     {v0.8h}, [x3]
+    add     x3, x3, #128
+    ld1     {v1.8h, v2.8h, v3.8h, v4.8h}, [x8], #64
+    fmla    v8.8h, v1.8h, v0.h[0]
+    fmla    v9.8h, v2.8h, v0.h[0]
+    fmla    v10.8h, v3.8h, v0.h[0]
+    fmla    v11.8h, v4.8h, v0.h[0]
+    fmla    v12.8h, v1.8h, v0.h[1]
+    fmla    v13.8h, v2.8h, v0.h[1]
+    fmla    v14.8h, v3.8h, v0.h[1]
+    fmla    v15.8h, v4.8h, v0.h[1]
+    fmla    v16.8h, v1.8h, v0.h[2]
+    fmla    v17.8h, v2.8h, v0.h[2]
+    fmla    v18.8h, v3.8h, v0.h[2]
+    fmla    v19.8h, v4.8h, v0.h[2]
+    fmla    v20.8h, v1.8h, v0.h[3]
+    fmla    v21.8h, v2.8h, v0.h[3]
+    fmla    v22.8h, v3.8h, v0.h[3]
+    fmla    v23.8h, v4.8h, v0.h[3]
+    fmla    v24.8h, v1.8h, v0.h[4]
+    fmla    v25.8h, v2.8h, v0.h[4]
+    fmla    v26.8h, v3.8h, v0.h[4]
+    fmla    v27.8h, v4.8h, v0.h[4]
+    fmla    v28.8h, v1.8h, v0.h[5]
+    fmla    v29.8h, v2.8h, v0.h[5]
+    fmla    v30.8h, v3.8h, v0.h[5]
+    fmla    v31.8h, v4.8h, v0.h[5]
+.endm
+// add one row's fp16 sums (a..d, AMX lane order) into out[x9 .. x9+31] fp32, then zero them
+.macro NFOLDROW a, b, c, d
+    uzp1    v5.8h, \a\().8h, \b\().8h   // channels 0-7
+    uzp1    v6.8h, \c\().8h, \d\().8h   // 8-15
+    uzp2    v7.8h, \a\().8h, \b\().8h   // 16-23
+    uzp2    v4.8h, \c\().8h, \d\().8h   // 24-31
+    ld1     {v0.4s, v1.4s, v2.4s, v3.4s}, [x9]
+    fcvtl   \a\().4s, v5.4h
+    fadd    v0.4s, v0.4s, \a\().4s
+    fcvtl2  \a\().4s, v5.8h
+    fadd    v1.4s, v1.4s, \a\().4s
+    fcvtl   \a\().4s, v6.4h
+    fadd    v2.4s, v2.4s, \a\().4s
+    fcvtl2  \a\().4s, v6.8h
+    fadd    v3.4s, v3.4s, \a\().4s
+    st1     {v0.4s, v1.4s, v2.4s, v3.4s}, [x9], #64
+    ld1     {v0.4s, v1.4s, v2.4s, v3.4s}, [x9]
+    fcvtl   \a\().4s, v7.4h
+    fadd    v0.4s, v0.4s, \a\().4s
+    fcvtl2  \a\().4s, v7.8h
+    fadd    v1.4s, v1.4s, \a\().4s
+    fcvtl   \a\().4s, v4.4h
+    fadd    v2.4s, v2.4s, \a\().4s
+    fcvtl2  \a\().4s, v4.8h
+    fadd    v3.4s, v3.4s, \a\().4s
+    st1     {v0.4s, v1.4s, v2.4s, v3.4s}, [x9]
+.endm
+.macro NZERO4 a, b, c, d
+    movi    \a\().16b, #0
+    movi    \b\().16b, #0
+    movi    \c\().16b, #0
+    movi    \d\().16b, #0
+.endm
+
+FUNC SYM(a_matmul_amxh_mix)
+    stp     x29, x30, [sp, #-176]!
+    mov     x29, sp
+    SAVE_X19_X28
+    stp     d8, d9, [sp, #96]
+    stp     d10, d11, [sp, #112]
+    stp     d12, d13, [sp, #128]
+    stp     d14, d15, [sp, #144]
+    mov     x19, x0                     // out
+    mov     x20, x1                     // xT16
+    mov     x21, x2                     // wp16
+    mov     x22, x3                     // bias
+    mov     x23, x4                     // n
+    mov     x24, x5                     // C
+    lsl     x26, x7, #2                 // output row bytes
+    str     x6, [sp, #160]              // W: end of the NEON channels
+    LOADADDR x9, G
+    ldr     x9, [x9, #G_MIX]
+    mul     x10, x6, x9
+    mov     x11, #100
+    udiv    x10, x10, x11
+    and     x10, x10, #~31              // Wn
+    sub     x25, x6, x10                // AMX channels [0, x25), NEON [x25, W)
+    AMX_SET
+    mov     x12, #1
+    lsl     x12, x12, #62               // fma16: fp32 Z, X0 x Y0
+    LOADADDR x27, amx_zeros
+    lsl     x28, x24, #6                // panel bytes: C x 32 halves
+    LOADADDR x1, G
+    ldr     x1, [x1, #G_AMX_PFD]
+    mov     x13, x25                    // NEON: first channel
+    mov     x14, #0                     //       first row block
+    cmp     x10, #0
+    cset    x16, gt                     //       active
+    cbz     x16, 1f
+    bl      nx_tile_start
+1:  mov     x7, #0                      // AMX: o
+2:  cmp     x7, x25
+    b.ge    60f
+    mov     x6, #0                      // h
+3:  mov     x9, x27
+    mov     x10, x27
+    cbz     x22, 31f
+    add     x9, x22, x7, lsl #2
+    add     x10, x9, #64
+31: mov     x11, #0
+32: orr     x17, x9, x11, lsl #56
+    AMXOP   4, 17
+    add     x11, x11, #1
+    orr     x17, x10, x11, lsl #56
+    AMXOP   4, 17
+    add     x11, x11, #1
+    cmp     x11, #64
+    b.lt    32b
+    lsr     x0, x7, #5
+    mul     x0, x0, x28
+    add     x0, x21, x0                 // panel o / 32
+    add     x2, x20, x6, lsl #1         // inputs h..h+31
+    mov     x4, x24
+4:  prfm    pldl2keep, [x0, x1]
+    AMXOP   0, 0
+    AMXOP   1, 2
+    AMXOP   15, 12
+    add     x0, x0, #64
+    add     x2, x2, #128
+    cbz     x16, 5f
+    NSTEP
+    NSTEP
+    add     x15, x15, #2
+    tst     x15, #63
+    b.ne    5f
+    bl      nx_boundary
+5:  subs    x4, x4, #1
+    b.gt    4b
+    mov     x11, #0                     // store rows h + t
+50: add     x9, x6, x11
+    cmp     x9, x23
+    b.ge    52f
+    cmp     x11, #32
+    b.ge    52f
+    madd    x17, x9, x26, x19
+    add     x17, x17, x7, lsl #2
+    lsl     x10, x11, #1
+    orr     x5, x17, x10, lsl #56
+    AMXOP   5, 5
+    add     x17, x17, #64
+    add     x10, x10, #1
+    orr     x5, x17, x10, lsl #56
+    AMXOP   5, 5
+    add     x11, x11, #1
+    b       50b
+52: add     x6, x6, #32
+    cmp     x6, x23
+    b.lt    3b
+    add     x7, x7, #32
+    b       2b
+60: cbz     x16, 9f                     // AMX done: finish the NEON channels alone
+    NSTEP
+    NSTEP
+    add     x15, x15, #2
+    tst     x15, #63
+    b.ne    60b
+    bl      nx_boundary
+    b       60b
+9:  AMX_CLR
+    ldp     d8, d9, [sp, #96]
+    ldp     d10, d11, [sp, #112]
+    ldp     d12, d13, [sp, #128]
+    ldp     d14, d15, [sp, #144]
+    RESTORE_X19_X28
+    ldp     x29, x30, [sp], #176
+    ret
+
+// NEON tile start: out rows x14 .. min(x14 + 6, n) - 1, channels x13 .. +31 = bias (or 0);
+// input and weight pointers to k = 0; sums zeroed.
+nx_tile_start:
+    madd    x9, x14, x26, x19
+    add     x9, x9, x13, lsl #2         // &out[row block][channel]
+    movi    v0.16b, #0
+    movi    v1.16b, #0
+    movi    v2.16b, #0
+    movi    v3.16b, #0
+    movi    v4.16b, #0
+    movi    v5.16b, #0
+    movi    v6.16b, #0
+    movi    v7.16b, #0
+    cbz     x22, 1f
+    add     x10, x22, x13, lsl #2
+    ld1     {v0.4s, v1.4s, v2.4s, v3.4s}, [x10], #64
+    ld1     {v4.4s, v5.4s, v6.4s, v7.4s}, [x10]
+1:  sub     x11, x23, x14               // rows: min(6, n - row block)
+    mov     x10, #6
+    cmp     x11, x10
+    csel    x11, x10, x11, gt
+2:  st1     {v0.4s, v1.4s, v2.4s, v3.4s}, [x9]
+    add     x17, x9, #64
+    st1     {v4.4s, v5.4s, v6.4s, v7.4s}, [x17]
+    add     x9, x9, x26
+    subs    x11, x11, #1
+    b.gt    2b
+    add     x3, x20, x14, lsl #1        // xT16 + row block
+    lsr     x8, x13, #5
+    mul     x8, x8, x28
+    add     x8, x21, x8                 // panel of the channel
+    mov     x15, #0
+    NZERO4  v8, v9, v10, v11
+    NZERO4  v12, v13, v14, v15
+    NZERO4  v16, v17, v18, v19
+    NZERO4  v20, v21, v22, v23
+    NZERO4  v24, v25, v26, v27
+    NZERO4  v28, v29, v30, v31
+    ret
+
+// every 64 k: fold the sums into the output rows; then the next 64 k, or the next tile
+// (row block, then channel block), or clear x16 when the NEON channels are done.
+nx_boundary:
+    sub     x11, x23, x14               // rows in this block (1..6 used)
+    madd    x10, x14, x26, x19
+    add     x10, x10, x13, lsl #2       // &out[row block][channel]
+    mov     x9, x10
+    NFOLDROW v8, v9, v10, v11
+    cmp     x11, #1
+    b.le    8f
+    add     x9, x10, x26
+    NFOLDROW v12, v13, v14, v15
+    cmp     x11, #2
+    b.le    8f
+    add     x9, x10, x26, lsl #1
+    NFOLDROW v16, v17, v18, v19
+    cmp     x11, #3
+    b.le    8f
+    add     x9, x10, x26, lsl #1
+    add     x9, x9, x26
+    NFOLDROW v20, v21, v22, v23
+    cmp     x11, #4
+    b.le    8f
+    add     x9, x10, x26, lsl #2
+    NFOLDROW v24, v25, v26, v27
+    cmp     x11, #5
+    b.le    8f
+    add     x9, x10, x26, lsl #2
+    add     x9, x9, x26
+    NFOLDROW v28, v29, v30, v31
+8:  NZERO4  v8, v9, v10, v11           // (rows past n: just clear)
+    NZERO4  v12, v13, v14, v15
+    NZERO4  v16, v17, v18, v19
+    NZERO4  v20, v21, v22, v23
+    NZERO4  v24, v25, v26, v27
+    NZERO4  v28, v29, v30, v31
+    cmp     x15, x24
+    b.lt    9f                          // more k in this tile
+    add     x14, x14, #6
+    cmp     x14, x23
+    b.lt    nx_tile_start
+    mov     x14, #0
+    add     x13, x13, #32
+    ldr     x9, [sp, #160]
+    cmp     x13, x9
+    b.lt    nx_tile_start
+    mov     x16, #0
+9:  ret
+#endif
+
 // void a_transpose64_h(uint16_t* xT, const float* x, long n, long C)
 // xT[k*64 + r] = fp16(x[min(r, n-1)*C + k]) for r < round_up(n, 4). Needs C % 4 == 0, n <= 64.
 // a_transpose64_hs(xT, x, n, kc, ld): the same for kc columns of rows ld floats apart.
@@ -3559,6 +3857,14 @@ amx_parts_env:
     sxtw    x9, w0
 5:  LOADADDR x10, G
     str     x9, [x10, #G_EQOS]
+    LOADADDR x0, s_env_amxmix           // amx16: NEON share of each thread's channels (percent)
+    bl      SYM(getenv)
+    mov     x9, #0
+    cbz     x0, 6f
+    bl      SYM(atoi)
+    sxtw    x9, w0
+6:  LOADADDR x10, G
+    str     x9, [x10, #G_MIX]
     ldp     x29, x30, [sp], #16
     ret
 
@@ -4739,7 +5045,15 @@ par_amx_mm:
     mov     x6, x23
     mov     x7, x11                     // ldo = OC
     ldr     x9, [x20, #G_AMX_FN]
-    blr     x9
+    ldr     x10, [x20, #G_PACKED]       // fp16 AMX with GPT2A_AMX_MIX: the fused AMX + NEON kernel
+    cmp     x10, #5
+    b.ne    14f
+    ldr     x10, [x20, #G_MIX]
+    cbz     x10, 14f
+    tst     x5, #63
+    b.ne    14f
+    LOADADDR x9, SYM(a_matmul_amxh_mix)
+14: blr     x9
     ldr     x9, [x20, #G_FUSE_GELU]
     cbz     x9, 30f
     ldr     x9, [x21, #0]
@@ -5391,6 +5705,11 @@ gen_done:
 FUNC SYM(a_set_f16i)
     LOADADDR x9, G
     str     x0, [x9, #G_F16I]
+    ret
+// test hook: void a_set_mix(long percent) sets G_MIX for a_matmul_amxh_mix
+FUNC SYM(a_set_mix)
+    LOADADDR x9, G
+    str     x0, [x9, #G_MIX]
     ret
 FUNC SYM(a_matmul_q8_test)
     ldr     x9, [sp]                    // 9th argument (stack on both ABIs)

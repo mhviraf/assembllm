@@ -1,3 +1,4 @@
+.arch armv8.2-a+dotprod
 // AMX probe, rounds 2 and 3 (native macOS on Apple silicon only): single-instruction wrappers for
 // register dumps, plus throughput loops shaped like the matmul kernels.
 // Encoding (github.com/corsix/amx): .word 0x00201000 | (op << 5) | Xn.
@@ -140,6 +141,45 @@ _loop_pair:
     and     x9, x9, #0x7f80
     add     x10, x10, #256
     and     x10, x10, #0xff00
+    subs    x0, x0, #1
+    b.gt    1b
+    ret
+
+// Overlap test: can a core run NEON work while it feeds the shared AMX unit?
+// void loop_neon(long n): 16 sdot per iteration on 8 accumulators (int8 matmul-like)
+// void loop_mix(long n, const void* xb, const void* yb, uint64_t op): per iteration the
+// loop_h32 step (ldx, ldy, fma16 with fp32 sums) plus the same 16 sdot, interleaved.
+.macro SDOT8
+    sdot    v0.4s, v16.16b, v24.4b[0]
+    sdot    v1.4s, v17.16b, v24.4b[0]
+    sdot    v2.4s, v18.16b, v24.4b[1]
+    sdot    v3.4s, v19.16b, v24.4b[1]
+    sdot    v4.4s, v16.16b, v24.4b[2]
+    sdot    v5.4s, v17.16b, v24.4b[2]
+    sdot    v6.4s, v18.16b, v24.4b[3]
+    sdot    v7.4s, v19.16b, v24.4b[3]
+.endm
+    .globl  _loop_neon
+    .p2align 4
+_loop_neon:
+1:  SDOT8
+    SDOT8
+    subs    x0, x0, #1
+    b.gt    1b
+    ret
+    .globl  _loop_mix
+    .p2align 4
+_loop_mix:
+    mov     x9, #0
+1:  add     x10, x1, x9
+    AMXOP   0, 10
+    SDOT8
+    add     x11, x2, x9
+    AMXOP   1, 11
+    SDOT8
+    AMXOP   15, 3
+    add     x9, x9, #64
+    and     x9, x9, #0x7fc0
     subs    x0, x0, #1
     b.gt    1b
     ret

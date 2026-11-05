@@ -15,7 +15,8 @@ The first kernels assumed X's offset in bits 0–8 and Y's in bits 10–18. That
 
 - `amx_probe` (round 1) and `amx_probe3` (rounds 2–3) probe the semantics and throughput. `amx_probe3` runs every case in its own process, so a case that faults costs one line. Its M1 output is in `probe_m1.txt`.
 - `amx_mm_test` checks every AMX matmul kernel against the NEON fp32 kernel and times it at GPT-2's shapes. The kernels are `a_matmul_amx32`, `a_matmul_amx16`, `a_matmul_amxr0` (fp32) and `a_matmul_amxh` (fp16).
-- `run_all.sh` runs the test plus full forward passes (`amx`, `amx16`, fp32 and int8 NEON) and writes `results.txt`. `run_all.sh probe` also runs the probe. `results_m1.txt` holds a run on a MacBook Air M1.
+- `run_all.sh` times full forward passes on the real weights and writes `results.txt`. `run_all.sh probe kernels` also runs the probe and the kernel test. `results_m1.txt` holds a full run on a MacBook Air M1. `amx_probe3 ecores` measures the efficiency cores' AMX unit; `amx_probe3 overlap` measures NEON work interleaved with AMX work.
+- `a_matmul_amxh_mix` (`../gpt2_forward.S`, `GPT2A_AMX_MIX`) runs AMX and NEON fp16 in one instruction stream. Assembling it with `-DAMX_NOP_TEST` on Linux turns the AMX instructions into nops, so its NEON half can be tested under qemu.
 - `build.sh` builds everything on Linux without Xcode (see `../native/README.md`).
 
 ## Throughput on M1 (`amx_probe3`)

@@ -22,16 +22,12 @@ QUIET="^max_seq\|^vocab\|^padded\|^num_\|^channels\|^\[GPT-2"
     if [ -f "$CK" ] && [ -f "$VAL" ]; then
         P=native/gpt2_profile
         echo "### forward pass, 64 tokens, 4 performance-core threads"
-        echo "--- amx16"
-        GPT2A_PRECISION=amx16 $P "$CK" "$VAL" 4 40 | grep "threads"
-        for q in 9 17 21 25; do
-            echo "--- amx16 + 4 E-core AMX threads at QoS $q, E share 20%"
-            GPT2A_PRECISION=amx16 GPT2A_AMX_E=4 GPT2A_AMX_ESHARE=20 GPT2A_AMX_EQOS=$q $P "$CK" "$VAL" 4 20 | grep "threads"
+        for m in 0 15 25 35 0 25; do
+            echo "--- amx16, GPT2A_AMX_MIX=$m (percent of channels on NEON next to AMX)"
+            GPT2A_PRECISION=amx16 GPT2A_AMX_MIX=$m $P "$CK" "$VAL" 4 40 | grep "threads"
         done
-        echo "--- amx16 + 2 E-core AMX threads at QoS 17, E share 15%"
-        GPT2A_PRECISION=amx16 GPT2A_AMX_E=2 GPT2A_AMX_ESHARE=15 $P "$CK" "$VAL" 4 20 | grep "threads"
-        echo "--- amx16 again"
-        GPT2A_PRECISION=amx16 $P "$CK" "$VAL" 4 40 | grep "threads"
+        echo "--- amx16, GPT2A_AMX_MIX=25 (profile)"
+        GPT2A_PRECISION=amx16 GPT2A_AMX_MIX=25 GPT2A_PROFILE=1 $P "$CK" "$VAL" 4 40 | grep -v "$QUIET"
         echo "--- int8 NEON (calibrated)"
         GPT2A_PRECISION=int8 GPT2A_CALIB="$CAL" $P "$CK" "$VAL" 4 40 | grep "threads"
     else
