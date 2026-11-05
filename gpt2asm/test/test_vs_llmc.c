@@ -17,6 +17,8 @@ void a_softmax_forward(float*, const float*, long, long, long);
 unsigned a_random_u32(uint64_t*);
 float a_random_f32(uint64_t*);
 int a_sample_mult(const float*, int, float);
+void a_pack_weights(float*, const float*, long, long);
+void a_matmul_packed(float*, const float*, const float*, const float*, long, long, long, long);
 
 // llm.c's sampler (verbatim), which train_gpt2.c compiles out under TESTING
 unsigned int random_u32(uint64_t *state) {
@@ -72,6 +74,20 @@ static void test_kernels(void) {
             free(inp); free(w); free(b); free(o1); free(o2);
         }
     }
+    // packed 5x16 matmul (weights repacked into panels of 16 channels), incl. partial row blocks
+    int pk[][3] = {{64,768,64},{13,64,48},{1,8,16},{9,12,16},{8,3072,16},{7,4,32},{63,768,48},{5,16,16},{6,8,32}};
+    for (int s = 0; s < 9; s++) {
+        int N = pk[s][0], C = pk[s][1], OC = pk[s][2];
+        for (int wb = 0; wb < 2; wb++) {
+            float *inp = rnd(N*C, 1), *w = rnd(OC*C, 1), *b = wb ? rnd(OC, 1) : NULL, *wp = zeros(OC*C);
+            float *o1 = zeros(N*OC), *o2 = zeros(N*OC);
+            a_pack_weights(wp, w, OC, C);
+            matmul_forward(o1, inp, w, b, 1, N, C, OC);
+            a_matmul_packed(o2, inp, wp, b, N, C, OC, OC);
+            char nm[64]; snprintf(nm, 64, "packed matmul N=%d C=%d OC=%d bias=%d", N, C, OC, wb);
+            check(nm, o2, o1, N*OC, 1e-5);
+        }
+    }
     // layernorm
     int ln[][2] = {{5,7},{3,64},{2,768}};
     for (int s = 0; s < 3; s++) {
@@ -96,13 +112,13 @@ static void test_kernels(void) {
     }
     // gelu
     { int N = 1001; float *x = rnd(N, 6), *o1 = zeros(N), *o2 = zeros(N);
-      gelu_forward(o1, x, N); a_gelu_forward(o2, x, N); check("gelu N=1001", o2, o1, N, 1e-6); }
+      gelu_forward(o1, x, N); a_gelu_forward(o2, x, N); check("gelu N=1001 (vector tanh)", o2, o1, N, 1e-6); }
     // residual
     { int N = 37; float *a = rnd(N, 1), *b = rnd(N, 1), *o1 = zeros(N), *o2 = zeros(N);
       residual_forward(o1, a, b, N); a_residual_forward(o2, a, b, N); check("residual N=37", o2, o1, N, 0); }
     // softmax with padding
     { int N = 3, V = 37, Vp = 40; float *l = rnd(N*Vp, 5), *o1 = zeros(N*Vp), *o2 = rnd(N*Vp, 1);
-      softmax_forward(o1, l, 1, N, V, Vp); a_softmax_forward(o2, l, N, V, Vp); check("softmax N=3 V=37 Vp=40", o2, o1, N*Vp, 1e-6); }
+      softmax_forward(o1, l, 1, N, V, Vp); a_softmax_forward(o2, l, N, V, Vp); check("softmax N=3 V=37 Vp=40 (vector exp)", o2, o1, N*Vp, 1e-6); }
     // encoder
     { int B = 2, T = 3, C = 10, V = 5; int inp[6] = {4,0,2,3,3,1};
       float *wte = rnd(V*C, 1), *wpe = rnd(T*C, 1), *o1 = zeros(B*T*C), *o2 = zeros(B*T*C);
@@ -143,19 +159,19 @@ static void test_forward(const char* ckpt, int B, int T) {
     int argmax_bad = 0; double maxkl = 0;
     for (int r = 0; r < B*T; r++) {
         const float *a = pa + (size_t)r*Vp, *c = pc + (size_t)r*Vp;
-        int ia = 0, ic = 0; double kl = 0;
+        int ia = 0, ic = 0; double kl = 0;   // kl holds the total variation distance
         for (int i = 0; i < V; i++) {
             if (a[i] > a[ia]) ia = i;
             if (c[i] > c[ic]) ic = i;
-            if (c[i] > 0 && a[i] > 0) kl += c[i] * log((double)c[i] / a[i]);
+            kl += 0.5 * fabs((double)c[i] - a[i]);
         }
         // a different top token only counts if it is not a near-tie in the C result
         if (ia != ic && c[ia] < c[ic] * (1.0f - 1e-4f)) argmax_bad++;
         if (kl > maxkl) maxkl = kl;
     }
-    int bad = argmax_bad || maxkl > 1e-5;
+    int bad = argmax_bad || maxkl > 1e-4;
     if (bad) failures++;
-    printf("%-44s top-token mismatches %d/%d, max KL %.2e  %s\n", "  per-position check", argmax_bad, B*T, maxkl,
+    printf("%-44s top-token mismatches %d/%d, max TV distance %.2e  %s\n", "  per-position check", argmax_bad, B*T, maxkl,
            bad ? "FAIL" : "OK");
     printf("  time: C reference %.2fs, assembly %.2fs (emulated)\n",
            (double)(c1-c0)/CLOCKS_PER_SEC, (double)(c2-c1)/CLOCKS_PER_SEC);

@@ -15,10 +15,10 @@ The same source also builds on aarch64 Linux.
 
 ## What's in `gpt2_forward.S`
 
-- **Kernels:** encoder, layernorm, matmul (4×4 NEON register tiles), causal attention, GELU, residual and softmax.
+- **Kernels:** encoder, layernorm, matmul (weights repacked at load time into 16-channel panels, 5×16 NEON register tiles), causal attention, GELU, residual and softmax. `exp` and `tanh` are vectorized and hand-written.
 - **Program:** checkpoint loader, decode-only tokenizer, xorshift sampler and the generation loop.
 - **Threads:** a small pthreads pool splits the matmuls, attention, GELU and softmax across cores. Set `GPT2A_THREADS=n`; the default is all CPUs.
-- **libc use:** limited to file I/O, `malloc`, `printf`/`putchar`, `expf`, `tanhf` and `pthread_create`/`pthread_join`.
+- **libc use:** limited to file I/O, `malloc`/`free`, `printf`/`putchar` and `pthread_create`/`pthread_join`.
 
 ## Check it against llm.c
 

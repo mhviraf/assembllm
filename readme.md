@@ -8,30 +8,38 @@ The code lives in [`gpt2asm/`](gpt2asm). That folder's README covers how to buil
 
 | Threads | llm.c (ms/sample) | assembly (ms/sample) | assembly speedup |
 |---|---|---|---|
-| 1 | 408 | 264 | **1.54×** |
-| 4 | 189 | 126 | **1.50×** |
+| 1 | 391 | 189 | **2.07×** |
+| 4 | 174 | 78 | **2.22×** |
 
 **Setup:**
 - **Machine:** MacBook Air (Apple silicon), Linux arm64 VM with 4 cores, gcc 11.4 with `-Ofast -march=native`.
 - **Threading:** llm.c is multi-threaded with OpenMP; the assembly uses its own pthreads pool.
 - **Workload:** 1,000 samples of 64 tokens, one forward pass each (B=1), at GPT-2 124M size. The two programs run interleaved and take turns going first, so warm-up and the Air's thermal throttling affect both equally.
 - **Weights:** random, in GPT-2 124M's exact shapes. Speed doesn't depend on the weight values.
-- **Agreement with llm.c:** max probability difference 9e-12, and the same top token at all 64,000 positions.
+- **Agreement with llm.c:** max probability difference 4e-10, and the same top token at all 64,000 positions.
 
-Short 30-sample runs, before the fanless Air heats up:
+## Optimization log
 
-| Threads | llm.c | assembly | speedup |
+I measured each step with a short run: 30 samples of 64 tokens, interleaved with llm.c. Absolute times drift as the fanless Air heats up, but both programs drift together. So the speedup over llm.c is the number to compare between steps. **Step gain** is how much that speedup changed from the previous step.
+
+| # | Change | 1 thread: ms · ×llm.c · step gain | 4 threads: ms · ×llm.c · step gain |
 |---|---|---|---|
-| 1 | 367 ms | 231 ms | 1.59× |
-| 2 | 213 ms | 140 ms | 1.52× |
-| 3 | 184 ms | 119 ms | 1.55× |
-| 4 | 149 ms | 97 ms | 1.54× |
+| 0 | Baseline: 4×4 dot-product NEON matmul, libc `expf`/`tanhf`, single-threaded | 280 · 1.31× | – |
+| 1 | pthreads pool: matmul split by output channel, attention by head, GELU by element, softmax by row | 286 · 1.30× · −1% | 138 · 1.11× |
+| 2 | Matmul loop order: weight blocks outside, rows inside | 291 · 1.27× · −2% | 128 · 1.15× · +4% |
+| 3 | Software prefetch of the next weight block | 231 · 1.59× · **+25%** | 97 · 1.54× · **+34%** |
+| 4 | Vectorized `exp`/`tanh`, plus weights repacked for an 8×8 kernel | 197 · 1.85× · **+16%** | 59 · 2.06× · **+34%** |
+| 5 | 5×16 kernel (20 accumulators instead of 16) | 182 · 2.03× · **+10%** | 60 · 2.12× · +3% |
 
-## Where the speed comes from
+What each step taught me:
 
-- **Register-tiled matmul:** 4 rows × 4 output channels per tile, using 16 NEON accumulators. Weight blocks sit on the outer loop, so each weight is read once per call. A single core reaches 70–80 GFLOP/s.
-- **Software prefetch:** the next weight block is fetched while the current one is in use. This mattered most for the final logits matmul, whose 154 MB weight table comes from main memory: it dropped from 111 ms to 65 ms on 1 thread, and from 58 ms to 20 ms on 4.
-- **Thread pool:** workers start at the beginning of each forward pass and stop at the end. Matmuls are split by output channel, attention by head, GELU by element and softmax by row.
+1. **Threads.** On 4 threads this was only 1.11× faster than llm.c. Profiling showed why: the final logits matmul barely got faster with more threads. Its 154 MB weight table comes from main memory on every pass.
+2. **Loop order.** I swapped the loops so each weight is read from memory once per call instead of 16 times. It barely helped, which showed that memory bandwidth wasn't the limit.
+3. **Prefetch.** This was the real fix. The cores were waiting on memory, because short bursts of weight reads are something the CPU's hardware prefetcher can't anticipate. Fetching the next block in software cut the logits matmul from 111 to 65 ms on 1 thread, and from 58 to 20 ms on 4.
+4. **Vector exp/tanh and repacked weights.** I measured these two together. GELU dropped from 13 to 2 ms per forward pass and softmax from 7.5 to 2.5 ms. With weights rearranged once at load time, the kernel needs no summing-up step at the end and loads less data per multiply-add, reaching about 80 GFLOP/s per core.
+5. **5×16 tile.** The 8×8 tile's 16 accumulators each received a new multiply-add exactly as fast as the previous one finished (4 cycles), so any hiccup stalled the core. A 5×16 tile has 20 accumulators, which gives the core slack, and loads less per multiply-add. It reaches about 94 GFLOP/s per core, close to peak. On 4 threads the gain is within noise.
+
+The full 1,000-sample runs of the final version are in the table at the top: 2.07× on 1 thread and 2.22× on 4.
 
 ## Reproduce
 

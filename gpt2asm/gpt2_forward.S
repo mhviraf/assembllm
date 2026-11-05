@@ -8,9 +8,15 @@
 //     cc -O2 gpt2_forward.S -o gpt2 -lm
 //     ./gpt2 [gpt2_124M.bin] [gpt2_tokenizer.bin] [num_tokens]
 //
-// Only libc is used: fopen/fread/fclose, malloc, printf/putchar/fflush,
-// atoi, getenv, sysconf, clock, exit, expf/tanhf, and pthread_create/join.
-// Everything else is written by hand.
+// Only libc is used: fopen/fread/fclose, malloc/free, printf/putchar/fflush,
+// atoi, getenv, sysconf, clock, exit, and pthread_create/join. Everything else,
+// including exp and tanh (vectorized, Cephes-style polynomial), is written by hand.
+//
+// Matmuls: at load time each weight matrix is repacked into panels of 16 output
+// channels (k-major), so the kernel computes 5 rows x 16 channels with 20 vector
+// accumulators and fmla-by-element: 80 multiply-adds per 9 loads, no horizontal
+// sums, and enough independent accumulators to keep all 4 FMA pipes busy.
+// Shapes that do not allow packing use the 4x4 dot-product kernel.
 //
 // Threads: the matmuls, attention, GELU and softmax are split across a small
 // thread pool (GPT2A_THREADS=n, default: all CPUs). Workers are started at the
@@ -81,6 +87,111 @@
     ldp     x27, x28, [sp, #80]
 .endm
 
+// --- vector exp: constants live in v20-v31 (load once with VEXP_CONSTS)
+// v20 hi clamp, v21 lo clamp, v22 log2(e), v23/v24 ln2 split, v25-v30 poly, v31 1.0
+.macro VEXP_CONSTS
+    LOADADDR x9, vexp_consts
+    ld1r    {v20.4s}, [x9], #4
+    ld1r    {v21.4s}, [x9], #4
+    ld1r    {v22.4s}, [x9], #4
+    ld1r    {v23.4s}, [x9], #4
+    ld1r    {v24.4s}, [x9], #4
+    ld1r    {v25.4s}, [x9], #4
+    ld1r    {v26.4s}, [x9], #4
+    ld1r    {v27.4s}, [x9], #4
+    ld1r    {v28.4s}, [x9], #4
+    ld1r    {v29.4s}, [x9], #4
+    ld1r    {v30.4s}, [x9], #4
+    ld1r    {v31.4s}, [x9], #4
+.endm
+
+// x = exp(x), 4 lanes. exp(x) = 2^n * e^r, n = round(x / ln2), |r| <= ln2/2,
+// e^r = 1 + r + r^2 * poly(r). Inputs are clamped to [-86, 88].
+.macro VEXP x, n, p, q
+    fmin    \x\().4s, \x\().4s, v20.4s
+    fmax    \x\().4s, \x\().4s, v21.4s
+    fmul    \n\().4s, \x\().4s, v22.4s
+    frintn  \n\().4s, \n\().4s
+    fmls    \x\().4s, \n\().4s, v23.4s
+    fmls    \x\().4s, \n\().4s, v24.4s
+    mov     \p\().16b, v26.16b
+    fmla    \p\().4s, v25.4s, \x\().4s
+    mov     \q\().16b, v27.16b
+    fmla    \q\().4s, \p\().4s, \x\().4s
+    mov     \p\().16b, v28.16b
+    fmla    \p\().4s, \q\().4s, \x\().4s
+    mov     \q\().16b, v29.16b
+    fmla    \q\().4s, \p\().4s, \x\().4s
+    mov     \p\().16b, v30.16b
+    fmla    \p\().4s, \q\().4s, \x\().4s
+    fmul    \q\().4s, \x\().4s, \x\().4s
+    fadd    \x\().4s, \x\().4s, v31.4s
+    fmla    \x\().4s, \p\().4s, \q\().4s
+    fcvtzs  \n\().4s, \n\().4s
+    shl     \n\().4s, \n\().4s, #23
+    add     \x\().4s, \x\().4s, \n\().4s
+.endm
+
+// v4 = x  ->  v0 = 0.5 x (1 + tanh(s (x + 0.044715 x^3))), tanh u = (e^2u - 1)/(e^2u + 1)
+// needs v16 = 0.044715, v17 = sqrt(2/pi), v18 = 0.5, exp constants. Uses v1-v3.
+.macro GELU4
+    fmul    v1.4s, v16.4s, v4.4s
+    fmul    v1.4s, v1.4s, v4.4s
+    fmul    v1.4s, v1.4s, v4.4s
+    fadd    v1.4s, v4.4s, v1.4s
+    fmul    v1.4s, v17.4s, v1.4s
+    fadd    v0.4s, v1.4s, v1.4s
+    VEXP    v0, v1, v2, v3
+    fsub    v1.4s, v0.4s, v31.4s
+    fadd    v0.4s, v0.4s, v31.4s
+    fdiv    v1.4s, v1.4s, v0.4s
+    fadd    v1.4s, v1.4s, v31.4s
+    fmul    v2.4s, v18.4s, v4.4s
+    fmul    v0.4s, v2.4s, v1.4s
+.endm
+
+// 5x16 kernel: one k of 5 rows (inputs v0-v4, lane i) times 16 channels (v5-v8)
+// accumulators: row 0 -> v12-v15, row 1 -> v16-v19, ..., row 4 -> v28-v31
+.macro FMA5x16 i
+    fmla    v12.4s, v5.4s, v0.s[\i]
+    fmla    v13.4s, v6.4s, v0.s[\i]
+    fmla    v14.4s, v7.4s, v0.s[\i]
+    fmla    v15.4s, v8.4s, v0.s[\i]
+    fmla    v16.4s, v5.4s, v1.s[\i]
+    fmla    v17.4s, v6.4s, v1.s[\i]
+    fmla    v18.4s, v7.4s, v1.s[\i]
+    fmla    v19.4s, v8.4s, v1.s[\i]
+    fmla    v20.4s, v5.4s, v2.s[\i]
+    fmla    v21.4s, v6.4s, v2.s[\i]
+    fmla    v22.4s, v7.4s, v2.s[\i]
+    fmla    v23.4s, v8.4s, v2.s[\i]
+    fmla    v24.4s, v5.4s, v3.s[\i]
+    fmla    v25.4s, v6.4s, v3.s[\i]
+    fmla    v26.4s, v7.4s, v3.s[\i]
+    fmla    v27.4s, v8.4s, v3.s[\i]
+    fmla    v28.4s, v5.4s, v4.s[\i]
+    fmla    v29.4s, v6.4s, v4.s[\i]
+    fmla    v30.4s, v7.4s, v4.s[\i]
+    fmla    v31.4s, v8.4s, v4.s[\i]
+.endm
+
+// four k steps: 5 input vectors (4 k each) and 4 x 16 packed weights
+.macro KSTEP5
+    ld1     {v0.4s}, [x0], #16
+    ld1     {v1.4s}, [x1], #16
+    ld1     {v2.4s}, [x2], #16
+    ld1     {v3.4s}, [x3], #16
+    ld1     {v4.4s}, [x4], #16
+    ld1     {v5.4s, v6.4s, v7.4s, v8.4s}, [x8], #64
+    FMA5x16 0
+    ld1     {v5.4s, v6.4s, v7.4s, v8.4s}, [x8], #64
+    FMA5x16 1
+    ld1     {v5.4s, v6.4s, v7.4s, v8.4s}, [x8], #64
+    FMA5x16 2
+    ld1     {v5.4s, v6.4s, v7.4s, v8.4s}, [x8], #64
+    FMA5x16 3
+.endm
+
 // float constants (bit patterns)
 .equ F_NEG10000,   0xC61C4000      // -10000.0f, initial max in llm.c
 .equ F_EPS,        0x3727C5AC      // 1e-5f, layernorm epsilon
@@ -124,7 +235,9 @@
 .equ G_POOL_FN,     1672     // part function for the current generation (0 = exit)
 .equ G_TASK,        1680     // up to 8 arguments for the part function
 .equ G_TIDS,        1744     // pthread_t of each worker (64 x 8 bytes)
-.equ G_SIZE,        2304
+.equ G_PACKED,      2304     // 1 when matmul weights are repacked for the 5x16 kernel
+.equ G_WTE_PACKED,  2312     // packed copy of wte for the logits matmul
+.equ G_SIZE,        2368
 .equ MAX_THREADS,   64
 
 // parameter tensor slots (offsets into G_PARAMS), llm.c order
@@ -151,6 +264,21 @@
     .data
     .p2align 6
 G:  .space G_SIZE
+
+    .p2align 4
+vexp_consts:
+    .word   0x42B00000             // hi clamp
+    .word   0xC2AC0000             // lo clamp
+    .word   0x3FB8AA3B             // log2(e)
+    .word   0x3F318000             // ln2 hi
+    .word   0xB95E8083             // ln2 lo
+    .word   0x39506967             // p0
+    .word   0x3AB743CE             // p1
+    .word   0x3C088908             // p2
+    .word   0x3D2AA9C1             // p3
+    .word   0x3E2AAAAA             // p4
+    .word   0x3F000000             // p5
+    .word   0x3F800000             // 1.0
 
 s_rb:            .asciz "rb"
 s_default_ckpt:  .asciz "gpt2_124M.bin"
@@ -475,6 +603,29 @@ mm_oblk:
 mm_rblk:
     cmp     x27, x14
     b.ge    mm_rtail
+    // software prefetch: while this weight block is used for every row block,
+    // pull in 1 KB of the next block per row block (64 rows cover 16 KB).
+    // The hardware prefetcher cannot see these short bursts coming.
+    add     x9, x28, #4
+    mul     x9, x9, x26
+    add     x9, x21, x9                 // next weight block
+    add     x9, x9, x27, lsl #8         // + (r / 4) * 1 KB
+    prfm    pldl1keep, [x9]
+    prfm    pldl1keep, [x9, #64]
+    prfm    pldl1keep, [x9, #128]
+    prfm    pldl1keep, [x9, #192]
+    prfm    pldl1keep, [x9, #256]
+    prfm    pldl1keep, [x9, #320]
+    prfm    pldl1keep, [x9, #384]
+    prfm    pldl1keep, [x9, #448]
+    prfm    pldl1keep, [x9, #512]
+    prfm    pldl1keep, [x9, #576]
+    prfm    pldl1keep, [x9, #640]
+    prfm    pldl1keep, [x9, #704]
+    prfm    pldl1keep, [x9, #768]
+    prfm    pldl1keep, [x9, #832]
+    prfm    pldl1keep, [x9, #896]
+    prfm    pldl1keep, [x9, #960]
     mul     x9, x27, x26
     add     x0, x20, x9                 // input rows r .. r+3
     add     x1, x0, x26
@@ -659,6 +810,7 @@ FUNC SYM(a_attention_heads)
     lsr     x9, x7, #32
     mul     x9, x9, x25
     str     x9, [sp, #152]              // h1 * hs
+    VEXP_CONSTS                         // v20-v31 (a_dot leaves them alone)
     // scale = 1.0 / sqrtf(hs), float sqrt then double divide, like the C code
     scvtf   s0, x25
     fsqrt   s0, s0
@@ -705,37 +857,55 @@ att_h:
     add     x13, x13, x14
     add     x12, x12, #1
     b       1b
-2:  // pass 2: exp(score - max) and its sum
-    movi    d10, #0
-    str     x21, [sp, #128]
-    add     x9, x27, #1
-    add     x9, x21, x9, lsl #2
-    str     x9, [sp, #136]
-3:  ldr     x9, [sp, #128]
-    ldr     x10, [sp, #136]
-    cmp     x9, x10
-    b.ge    4f
-    ldr     s0, [x9]
-    fsub    s0, s0, s9
-    bl      SYM(expf)
-    ldr     x9, [sp, #128]
-    str     s0, [x9], #4
-    str     x9, [sp, #128]
-    fadd    s10, s10, s0
-    b       3b
-4:  movi    d11, #0                     // inv = sum == 0 ? 0 : 1/sum
-    fcmp    s10, #0.0
-    b.eq    5f
-    fmov    s0, #1.0
-    fdiv    s11, s0, s10
-5:  // pass 3: normalize
+2:  // pass 2: exp(score - max) and its sum, 4 at a time
+    dup     v16.4s, v9.s[0]
+    movi    v17.16b, #0
+    movi    d18, #0
     mov     x9, x21
     add     x10, x27, #1
-6:  ldr     s0, [x9]
+3:  cmp     x10, #4
+    b.lt    4f
+    ld1     {v0.4s}, [x9]
+    fsub    v0.4s, v0.4s, v16.4s
+    VEXP    v0, v1, v2, v3
+    st1     {v0.4s}, [x9], #16
+    fadd    v17.4s, v17.4s, v0.4s
+    sub     x10, x10, #4
+    b       3b
+4:  cbz     x10, 5f
+    ldr     s0, [x9]
+    fsub    s0, s0, s9
+    VEXP    v0, v1, v2, v3
+    str     s0, [x9], #4
+    fadd    s18, s18, s0
+    sub     x10, x10, #1
+    b       4b
+5:  faddp   v17.4s, v17.4s, v17.4s
+    faddp   s17, v17.2s
+    fadd    s10, s17, s18               // expsum
+    movi    d11, #0                     // inv = sum == 0 ? 0 : 1/sum
+    fcmp    s10, #0.0
+    b.eq    6f
+    fmov    s0, #1.0
+    fdiv    s11, s0, s10
+6:  // pass 3: normalize
+    dup     v1.4s, v11.s[0]
+    mov     x9, x21
+    add     x10, x27, #1
+55: cmp     x10, #4
+    b.lt    56f
+    ld1     {v0.4s}, [x9]
+    fmul    v0.4s, v0.4s, v1.4s
+    st1     {v0.4s}, [x9], #16
+    sub     x10, x10, #4
+    b       55b
+56: cbz     x10, 57f
+    ldr     s0, [x9]
     fmul    s0, s0, s11
     str     s0, [x9], #4
-    subs    x10, x10, #1
-    b.gt    6b
+    sub     x10, x10, #1
+    b       56b
+57:
     // pass 4: out[b,t,h,:] = sum_t2 att[t2] * v_t2
     add     x9, x26, x27
     mul     x9, x9, x23
@@ -748,7 +918,7 @@ att_h:
     sub     x12, x12, #1
     b       7b
 8:  add     x13, x23, x23, lsl #1       // C3
-    lsl     x14, x13, #2                // row bytes (recomputed, expf clobbers x14)
+    lsl     x14, x13, #2                // row bytes (recomputed, a_dot calls above)
     mul     x9, x26, x13
     add     x9, x9, x23, lsl #1         // + 2C
     add     x9, x9, x28
@@ -795,39 +965,28 @@ att_done:
     ret
 
 // void a_gelu_forward(float* out, const float* inp, long N)    (tanh GELU)
-// out = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+// out = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))), 4 at a time
 FUNC SYM(a_gelu_forward)
-    stp     x29, x30, [sp, #-128]!
-    mov     x29, sp
-    SAVE_X19_X28
-    stp     d8, d9, [sp, #96]
-    stp     d10, d11, [sp, #112]
-    mov     x19, x0
-    mov     x20, x1
-    mov     x21, x2
-    FLOADK  s8, w9, F_GELU_CUBE
-    FLOADK  s9, w9, F_GELU_SCALE
-1:  cbz     x21, 2f
-    ldr     s10, [x20], #4              // x
-    fmul    s0, s8, s10
-    fmul    s0, s0, s10
-    fmul    s0, s0, s10                 // 0.044715 * x * x * x
-    fadd    s0, s10, s0
-    fmul    s0, s9, s0
-    bl      SYM(tanhf)
-    fmov    s1, #1.0
-    fadd    s0, s1, s0
-    fmov    s1, #0.5
-    fmul    s1, s1, s10
-    fmul    s0, s1, s0
-    str     s0, [x19], #4
-    sub     x21, x21, #1
+    VEXP_CONSTS
+    FLOADK  s16, w9, F_GELU_CUBE
+    dup     v16.4s, v16.s[0]
+    FLOADK  s17, w9, F_GELU_SCALE
+    dup     v17.4s, v17.s[0]
+    fmov    v18.4s, #0.5
+1:  cmp     x2, #4
+    b.lt    2f
+    ld1     {v4.4s}, [x1], #16
+    GELU4
+    st1     {v0.4s}, [x0], #16
+    sub     x2, x2, #4
     b       1b
-2:  ldp     d8, d9, [sp, #96]
-    ldp     d10, d11, [sp, #112]
-    RESTORE_X19_X28
-    ldp     x29, x30, [sp], #128
-    ret
+2:  cbz     x2, 3f
+    ldr     s4, [x1], #4
+    GELU4
+    str     s0, [x0], #4
+    sub     x2, x2, #1
+    b       2b
+3:  ret
 
 // void a_residual_forward(float* out, const float* a, const float* b, long N)
 FUNC SYM(a_residual_forward)
@@ -862,82 +1021,371 @@ FUNC SYM(a_residual_forward)
 // void a_softmax_forward(float* probs, const float* logits, long N, long V, long Vp)
 // Softmax over the first V entries of each row; padding [V, Vp) is set to 0.
 FUNC SYM(a_softmax_forward)
-    stp     x29, x30, [sp, #-112]!
-    mov     x29, sp
-    SAVE_X19_X28
-    stp     d8, d9, [sp, #96]
-    mov     x19, x0                     // probs
-    mov     x20, x1                     // logits
-    mov     x21, x2                     // N
-    mov     x22, x3                     // V
-    mov     x23, x4                     // Vp
-    mov     x24, #0                     // row
+    VEXP_CONSTS
+    mov     x8, #0                      // row
 sm_row:
-    cmp     x24, x21
+    cmp     x8, x2
     b.ge    sm_done
-    mul     x9, x24, x23
-    add     x25, x20, x9, lsl #2        // logits row
-    add     x26, x19, x9, lsl #2        // probs row
-    // max (starting from -10000, like llm.c)
-    FLOADK  s8, w9, F_NEG10000
-    dup     v16.4s, v8.s[0]
-    mov     x9, x25
-    mov     x10, x22
-1:  cmp     x10, #4
+    mul     x9, x8, x4
+    add     x10, x1, x9, lsl #2         // logits row
+    add     x11, x0, x9, lsl #2         // probs row
+    FLOADK  s16, w9, F_NEG10000         // max, starting from -10000 like llm.c
+    dup     v16.4s, v16.s[0]
+    mov     x12, x10
+    mov     x13, x3
+1:  cmp     x13, #4
     b.lt    2f
-    ld1     {v0.4s}, [x9], #16
+    ld1     {v0.4s}, [x12], #16
     fmax    v16.4s, v16.4s, v0.4s
-    sub     x10, x10, #4
+    sub     x13, x13, #4
     b       1b
-2:  fmaxv   s8, v16.4s
-3:  cbz     x10, 4f
-    ldr     s0, [x9], #4
-    fmax    s8, s8, s0
-    sub     x10, x10, #1
+2:  fmaxv   s16, v16.4s
+3:  cbz     x13, 4f
+    ldr     s0, [x12], #4
+    fmax    s16, s16, s0
+    sub     x13, x13, #1
     b       3b
-4:  // exp and sum, in order
-    movi    d9, #0
-    mov     x27, #0
-5:  cmp     x27, x22
-    b.ge    6f
-    ldr     s0, [x25, x27, lsl #2]
-    fsub    s0, s0, s8
-    bl      SYM(expf)
-    str     s0, [x26, x27, lsl #2]
-    fadd    s9, s9, s0
-    add     x27, x27, #1
+4:  dup     v17.4s, v16.s[0]
+    movi    v18.16b, #0                 // vector sum
+    movi    d19, #0                     // tail sum
+    mov     x12, x10
+    mov     x14, x11
+    mov     x13, x3
+5:  cmp     x13, #4
+    b.lt    6f
+    ld1     {v0.4s}, [x12], #16
+    fsub    v0.4s, v0.4s, v17.4s
+    VEXP    v0, v1, v2, v3
+    st1     {v0.4s}, [x14], #16
+    fadd    v18.4s, v18.4s, v0.4s
+    sub     x13, x13, #4
     b       5b
-6:  // divide by the sum
-    dup     v1.4s, v9.s[0]
-    mov     x9, x26
-    mov     x10, x22
-7:  cmp     x10, #4
-    b.lt    8f
-    ld1     {v0.4s}, [x9]
+6:  cbz     x13, 7f
+    ldr     s0, [x12], #4
+    fsub    s0, s0, s16
+    VEXP    v0, v1, v2, v3
+    str     s0, [x14], #4
+    fadd    s19, s19, s0
+    sub     x13, x13, #1
+    b       6b
+7:  faddp   v18.4s, v18.4s, v18.4s
+    faddp   s18, v18.2s
+    fadd    s18, s18, s19               // sum
+    dup     v1.4s, v18.s[0]
+    mov     x12, x11
+    mov     x13, x3
+8:  cmp     x13, #4
+    b.lt    9f
+    ld1     {v0.4s}, [x12]
     fdiv    v0.4s, v0.4s, v1.4s
-    st1     {v0.4s}, [x9], #16
-    sub     x10, x10, #4
-    b       7b
-8:  cbz     x10, 9f
-    ldr     s0, [x9]
-    fdiv    s0, s0, s9
-    str     s0, [x9], #4
-    sub     x10, x10, #1
+    st1     {v0.4s}, [x12], #16
+    sub     x13, x13, #4
     b       8b
-9:  sub     x10, x23, x22               // zero the padding
-10: cbz     x10, 11f
-    str     wzr, [x9], #4
-    sub     x10, x10, #1
-    b       10b
-11: add     x24, x24, #1
+9:  cbz     x13, 10f
+    ldr     s0, [x12]
+    fdiv    s0, s0, s18
+    str     s0, [x12], #4
+    sub     x13, x13, #1
+    b       9b
+10: sub     x13, x4, x3                 // zero the padding
+11: cbz     x13, 12f
+    str     wzr, [x12], #4
+    sub     x13, x13, #1
+    b       11b
+12: add     x8, x8, #1
     b       sm_row
 sm_done:
-    ldp     d8, d9, [sp, #96]
-    RESTORE_X19_X28
-    ldp     x29, x30, [sp], #112
     ret
 
 // ===========================================================================
+// packed matmul
+
+// void a_pack_weights(float* dst, const float* src, long OC, long C)
+// dst[(q*C + k)*16 + j] = src[(q*16 + j)*C + k]   (OC % 16 == 0)
+FUNC SYM(a_pack_weights)
+    lsl     x9, x3, #2                  // row bytes
+    lsl     x10, x9, #4                 // 16 rows
+    mov     x11, #0                     // first channel of the panel
+1:  cmp     x11, x2
+    b.ge    9f
+    mov     x12, x1                     // column k of row 0 of this panel
+    mov     x13, x3                     // k
+2:  mov     x14, x12
+    mov     x15, #16
+3:  ldr     s0, [x14]
+    str     s0, [x0], #4
+    add     x14, x14, x9
+    subs    x15, x15, #1
+    b.gt    3b
+    add     x12, x12, #4
+    subs    x13, x13, #1
+    b.gt    2b
+    add     x1, x1, x10
+    add     x11, x11, #16
+    b       1b
+9:  ret
+
+// copy_f32(dst, src, n)
+    .p2align 4
+copy_f32:
+1:  cmp     x2, #16
+    b.lt    2f
+    ld1     {v0.4s, v1.4s, v2.4s, v3.4s}, [x1], #64
+    st1     {v0.4s, v1.4s, v2.4s, v3.4s}, [x0], #64
+    sub     x2, x2, #16
+    b       1b
+2:  cbz     x2, 3f
+    ldr     s0, [x1], #4
+    str     s0, [x0], #4
+    sub     x2, x2, #1
+    b       2b
+3:  ret
+
+// pack_inplace(float* w, long OC, long C, float* tmp): repack an OC x C matrix in place
+    .p2align 4
+pack_inplace:
+    stp     x29, x30, [sp, #-48]!
+    mov     x29, sp
+    stp     x19, x20, [sp, #16]
+    str     x21, [sp, #32]
+    mov     x19, x0
+    mul     x20, x1, x2
+    mov     x21, x3
+    mov     x9, x1
+    mov     x10, x2
+    mov     x0, x21
+    mov     x1, x19
+    mov     x2, x9
+    mov     x3, x10
+    bl      SYM(a_pack_weights)
+    mov     x0, x19
+    mov     x1, x21
+    mov     x2, x20
+    bl      copy_f32
+    ldp     x19, x20, [sp, #16]
+    ldr     x21, [sp, #32]
+    ldp     x29, x30, [sp], #48
+    ret
+
+// pack_all: repack every matmul weight (in place) and make a packed copy of wte
+    .p2align 4
+pack_all:
+    stp     x29, x30, [sp, #-96]!
+    mov     x29, sp
+    SAVE_X19_X28
+    LOADADDR x19, G
+    ldr     x20, [x19, #G_C]
+    ldr     x21, [x19, #G_L]
+    mul     x0, x20, x20
+    lsl     x0, x0, #4                  // scratch: 4C*C floats
+    bl      xmalloc
+    mov     x22, x0
+    add     x24, x20, x20, lsl #1       // 3C
+    lsl     x25, x20, #2                // 4C
+    mov     x23, #0                     // layer
+1:  cmp     x23, x21
+    b.ge    2f
+    mul     x9, x23, x24
+    mul     x9, x9, x20
+    ldr     x0, [x19, #P_QKVW]
+    add     x0, x0, x9, lsl #2
+    mov     x1, x24
+    mov     x2, x20
+    mov     x3, x22
+    bl      pack_inplace
+    mul     x9, x23, x20
+    mul     x9, x9, x20
+    ldr     x0, [x19, #P_ATTPROJW]
+    add     x0, x0, x9, lsl #2
+    mov     x1, x20
+    mov     x2, x20
+    mov     x3, x22
+    bl      pack_inplace
+    mul     x9, x23, x25
+    mul     x9, x9, x20
+    ldr     x0, [x19, #P_FCW]
+    add     x0, x0, x9, lsl #2
+    mov     x1, x25
+    mov     x2, x20
+    mov     x3, x22
+    bl      pack_inplace
+    mul     x9, x23, x25
+    mul     x9, x9, x20
+    ldr     x0, [x19, #P_FCPROJW]
+    add     x0, x0, x9, lsl #2
+    mov     x1, x20
+    mov     x2, x25
+    mov     x3, x22
+    bl      pack_inplace
+    add     x23, x23, #1
+    b       1b
+2:  mov     x0, x22
+    bl      SYM(free)
+    ldr     x9, [x19, #G_VP]
+    mul     x0, x9, x20
+    lsl     x0, x0, #2
+    bl      xmalloc
+    str     x0, [x19, #G_WTE_PACKED]
+    ldr     x1, [x19, #P_WTE]
+    ldr     x2, [x19, #G_VP]
+    mov     x3, x20
+    bl      SYM(a_pack_weights)
+    mov     x9, #1
+    str     x9, [x19, #G_PACKED]
+    RESTORE_X19_X28
+    ldp     x29, x30, [sp], #96
+    ret
+
+// void a_matmul_packed(float* out, const float* inp, const float* wp,
+//                      const float* bias, long N, long C, long OC, long ldo)
+// wp: OC x C weights repacked by a_pack_weights. Needs C % 4 == 0, OC % 16 == 0.
+// Tiles of 5 rows x 16 channels. A last partial row block reuses the last row
+// for the missing rows (so the weights are still read once) and stores only real rows.
+// The first row block of each panel prefetches the next panel into L2.
+FUNC SYM(a_matmul_packed)
+    stp     x29, x30, [sp, #-160]!
+    mov     x29, sp
+    SAVE_X19_X28
+    stp     d8, d9, [sp, #96]
+    stp     d10, d11, [sp, #112]
+    stp     d12, d13, [sp, #128]
+    stp     d14, d15, [sp, #144]
+    mov     x19, x0                     // out
+    mov     x20, x1                     // inp
+    mov     x21, x2                     // packed weights
+    mov     x22, x3                     // bias
+    mov     x23, x4                     // N
+    mov     x24, x5                     // C
+    mov     x25, x6                     // OC
+    lsl     x26, x7, #2                 // output row bytes
+    lsl     x12, x24, #2                // input row bytes
+    lsl     x13, x24, #6                // panel bytes (C x 16 floats)
+    add     x14, x13, #64
+    add     x17, x13, #128
+    add     x11, x13, #192
+    sub     x16, x23, #1                // last row
+    mov     x15, x21                    // current panel
+    mov     x28, #0                     // o
+pk_panel:
+    cmp     x28, x25
+    b.ge    pk_done
+    mov     x27, #0                     // r
+pk_rblk:
+    cmp     x27, x23
+    b.ge    pk_next
+    // row pointers r .. r+4, clamped to the last row
+    madd    x0, x27, x12, x20
+    add     x9, x27, #1
+    cmp     x9, x16
+    csel    x9, x16, x9, gt
+    madd    x1, x9, x12, x20
+    add     x9, x27, #2
+    cmp     x9, x16
+    csel    x9, x16, x9, gt
+    madd    x2, x9, x12, x20
+    add     x9, x27, #3
+    cmp     x9, x16
+    csel    x9, x16, x9, gt
+    madd    x3, x9, x12, x20
+    add     x9, x27, #4
+    cmp     x9, x16
+    csel    x9, x16, x9, gt
+    madd    x4, x9, x12, x20
+    mov     x8, x15
+    movi    v12.16b, #0
+    movi    v13.16b, #0
+    movi    v14.16b, #0
+    movi    v15.16b, #0
+    movi    v16.16b, #0
+    movi    v17.16b, #0
+    movi    v18.16b, #0
+    movi    v19.16b, #0
+    movi    v20.16b, #0
+    movi    v21.16b, #0
+    movi    v22.16b, #0
+    movi    v23.16b, #0
+    movi    v24.16b, #0
+    movi    v25.16b, #0
+    movi    v26.16b, #0
+    movi    v27.16b, #0
+    movi    v28.16b, #0
+    movi    v29.16b, #0
+    movi    v30.16b, #0
+    movi    v31.16b, #0
+    mov     x9, x24
+    cbnz    x27, 2f
+1:  prfm    pldl2keep, [x8, x13]        // first row block: fetch the next panel
+    prfm    pldl2keep, [x8, x14]
+    prfm    pldl2keep, [x8, x17]
+    prfm    pldl2keep, [x8, x11]
+    KSTEP5
+    subs    x9, x9, #4
+    b.gt    1b
+    b       3f
+2:  KSTEP5
+    subs    x9, x9, #4
+    b.gt    2b
+3:  cbz     x22, 4f
+    add     x9, x22, x28, lsl #2
+    ld1     {v5.4s, v6.4s, v7.4s, v8.4s}, [x9]
+    fadd    v12.4s, v12.4s, v5.4s
+    fadd    v13.4s, v13.4s, v6.4s
+    fadd    v14.4s, v14.4s, v7.4s
+    fadd    v15.4s, v15.4s, v8.4s
+    fadd    v16.4s, v16.4s, v5.4s
+    fadd    v17.4s, v17.4s, v6.4s
+    fadd    v18.4s, v18.4s, v7.4s
+    fadd    v19.4s, v19.4s, v8.4s
+    fadd    v20.4s, v20.4s, v5.4s
+    fadd    v21.4s, v21.4s, v6.4s
+    fadd    v22.4s, v22.4s, v7.4s
+    fadd    v23.4s, v23.4s, v8.4s
+    fadd    v24.4s, v24.4s, v5.4s
+    fadd    v25.4s, v25.4s, v6.4s
+    fadd    v26.4s, v26.4s, v7.4s
+    fadd    v27.4s, v27.4s, v8.4s
+    fadd    v28.4s, v28.4s, v5.4s
+    fadd    v29.4s, v29.4s, v6.4s
+    fadd    v30.4s, v30.4s, v7.4s
+    fadd    v31.4s, v31.4s, v8.4s
+4:  sub     x10, x23, x27               // rows left (>= 1)
+    mul     x9, x27, x26
+    add     x9, x9, x28, lsl #2
+    add     x9, x19, x9
+    st1     {v12.4s, v13.4s, v14.4s, v15.4s}, [x9]
+    cmp     x10, #1
+    b.le    5f
+    add     x9, x9, x26
+    st1     {v16.4s, v17.4s, v18.4s, v19.4s}, [x9]
+    cmp     x10, #2
+    b.le    5f
+    add     x9, x9, x26
+    st1     {v20.4s, v21.4s, v22.4s, v23.4s}, [x9]
+    cmp     x10, #3
+    b.le    5f
+    add     x9, x9, x26
+    st1     {v24.4s, v25.4s, v26.4s, v27.4s}, [x9]
+    cmp     x10, #4
+    b.le    5f
+    add     x9, x9, x26
+    st1     {v28.4s, v29.4s, v30.4s, v31.4s}, [x9]
+5:  add     x27, x27, #5
+    b       pk_rblk
+pk_next:
+    add     x15, x15, x13
+    add     x28, x28, #16
+    b       pk_panel
+pk_done:
+    ldp     d8, d9, [sp, #96]
+    ldp     d10, d11, [sp, #112]
+    ldp     d12, d13, [sp, #128]
+    ldp     d14, d15, [sp, #144]
+    RESTORE_X19_X28
+    ldp     x29, x30, [sp], #160
+    ret
+
+// ===========================================================================
+// model// ===========================================================================
 // model
 
 // void gpt2a_build_from_checkpoint(const char* path)
@@ -1080,7 +1528,14 @@ FUNC SYM(gpt2a_build_from_checkpoint)
     b.lt    7b
     mov     x0, x21
     bl      SYM(fclose)
-    RESTORE_X19_X28
+    // repack matmul weights for the 5x16 kernel when the shapes allow it
+    ldr     x9, [x20, #G_C]
+    ldr     x10, [x20, #G_VP]
+    orr     x9, x9, x10
+    tst     x9, #15                     // C and Vp multiples of 16
+    b.ne    8f
+    bl      pack_all
+8:  RESTORE_X19_X28
     ldp     x29, x30, [sp], #96
     ret
 
@@ -1299,8 +1754,10 @@ fwd_final:
     // logits = lnf @ wte^T (weights tied, no bias), into the probs buffer
     ldr     x0, [x28, #G_ACT_PROBS]
     ldr     x1, [x28, #G_ACT_LN]
+    ldr     x2, [x28, #G_WTE_PACKED]
+    cbnz    x2, 8f
     ldr     x2, [x28, #P_WTE]
-    mov     x3, #0
+8:  mov     x3, #0
     mov     x4, x22
     mov     x5, x23
     ldr     x6, [x28, #G_VP]
@@ -1541,6 +1998,7 @@ psoftmax:                               // (probs, logits, N, V, Vp)
     .p2align 4
 par_matmul:
     LOADADDR x9, G
+    ldr     x16, [x9, #G_PACKED]
     ldr     x10, [x9, #G_NTHREADS]
     add     x15, x9, #G_TASK
     ldr     x11, [x15, #48]             // OC
@@ -1569,7 +2027,9 @@ par_matmul:
 1:  ldr     x4, [x15, #32]              // N
     sub     x6, x14, x13                // channels in this slice
     mov     x7, x11                     // ldo = OC
+    cbnz    x16, 2f
     b       SYM(a_matmul_strided)
+2:  b       SYM(a_matmul_packed)
 9:  ret
 
 // attention: heads split evenly, one scratch row per part
