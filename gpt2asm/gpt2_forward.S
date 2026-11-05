@@ -33,6 +33,11 @@
 // by s_k in the weights, moving GPT-2's outlier channels into the weights.
 // a = 0.25 by default (best for GPT-2 124M); GPT2A_SQ_ALPHA=50 or 75 for 0.5, 0.75.
 //
+// GPT2A_PRECISION=amx (native macOS only): fp32 matmuls on Apple's AMX matrix
+// coprocessor (undocumented; encoding from github.com/corsix/amx). Each fma32 is a
+// 16 x 16 outer product; a pass computes 64 rows x 16 channels in the 64 Z rows.
+// Same fp32 math as the NEON path, just a different unit doing it.
+//
 // Threads: the matmuls, attention, GELU and softmax are split across a small
 // thread pool (GPT2A_THREADS=n, default: all CPUs). Workers are started at the
 // beginning of each forward pass and joined at the end, so nothing spins between
@@ -389,6 +394,23 @@
 96:
 .endm
 
+// AMX: .word 0x00201000 | (op << 5) | Xn (op 0 ldx, 1 ldy, 4 ldz, 5 stz, 12 fma32)
+.macro AMXOP op, reg
+    .word   0x00201000 + ((\op) << 5) + (\reg)
+.endm
+.macro AMX_SET
+    nop
+    nop
+    nop
+    .word   0x00201220
+.endm
+.macro AMX_CLR
+    nop
+    nop
+    nop
+    .word   0x00201221
+.endm
+
 // float constants (bit patterns)
 .equ F_NEG10000,   0xC61C4000      // -10000.0f, initial max in llm.c
 .equ F_EPS,        0x3727C5AC      // 1e-5f, layernorm epsilon
@@ -446,7 +468,8 @@
 .equ G_PROF_LAST,   2384     // counter value at the last profiling mark
 .equ G_PROF_N,      2392     // forward passes profiled
 .equ G_PROF,        2400     // 12 per-stage tick totals
-.equ G_SIZE,        2496
+.equ G_ACT_XT,      2496     // AMX: matmul input transposed in blocks of 64 rows (4C x 64)
+.equ G_SIZE,        2560
 .equ NPROF,         12
 .equ KC16,          64       // fp16 accumulation block before folding into fp32
 .equ MAX_THREADS,   64
@@ -475,6 +498,9 @@
     .data
     .p2align 6
 G:  .space G_SIZE
+    .p2align 6
+amx_zeros:
+    .space  64
 
     .p2align 4
 vexp_consts:
@@ -545,6 +571,8 @@ s_calib:         .asciz "calibrating int8 (SmoothQuant) on %ld tokens\n"
 s_nocalib:       .asciz "note: int8 without GPT2A_CALIB=<token file> is uncalibrated and much less accurate\n"
 s_err_data:      .asciz "Error: bad calibration token file\n"
 s_prec16:        .asciz "precision: fp16 weights and matmul inputs, fp32 sums\n"
+s_precamx:       .asciz "precision: fp32 on the AMX matrix coprocessor\n"
+s_noamx:         .asciz "note: amx needs native macOS on Apple silicon; using fp32 NEON\n"
 s_prec8:         .asciz "precision: int8 weights (per channel) and matmul inputs (per row), int32 sums\n"
 s_threads:       .asciz "threads: %ld\n"
 s_err_thread:    .asciz "Error: pthread_create failed\n"
@@ -2866,6 +2894,131 @@ calibrate:
     ret
 
 // ===========================================================================
+// AMX matmul (fp32)
+
+// void a_transpose64(float* xT, const float* x, long n, long C)
+// xT[k*64 + r] = x[min(r, n-1)*C + k] for r < round_up(n, 4). Needs C % 4 == 0, n <= 64.
+FUNC SYM(a_transpose64)
+    lsl     x9, x3, #2
+    sub     x10, x2, #1
+    mov     x11, #0
+1:  cmp     x11, x2
+    b.ge    9f
+    madd    x12, x11, x9, x1
+    add     x4, x11, #1
+    cmp     x4, x10
+    csel    x4, x10, x4, gt
+    madd    x13, x4, x9, x1
+    add     x4, x11, #2
+    cmp     x4, x10
+    csel    x4, x10, x4, gt
+    madd    x14, x4, x9, x1
+    add     x4, x11, #3
+    cmp     x4, x10
+    csel    x4, x10, x4, gt
+    madd    x15, x4, x9, x1
+    add     x16, x0, x11, lsl #2
+    mov     x17, x3
+2:  ld1     {v0.4s}, [x12], #16
+    ld1     {v1.4s}, [x13], #16
+    ld1     {v2.4s}, [x14], #16
+    ld1     {v3.4s}, [x15], #16
+    trn1    v4.4s, v0.4s, v1.4s
+    trn2    v5.4s, v0.4s, v1.4s
+    trn1    v6.4s, v2.4s, v3.4s
+    trn2    v7.4s, v2.4s, v3.4s
+    trn1    v0.2d, v4.2d, v6.2d
+    trn1    v1.2d, v5.2d, v7.2d
+    trn2    v2.2d, v4.2d, v6.2d
+    trn2    v3.2d, v5.2d, v7.2d
+    str     q0, [x16]
+    str     q1, [x16, #256]
+    str     q2, [x16, #512]
+    str     q3, [x16, #768]
+    add     x16, x16, #1024
+    subs    x17, x17, #4
+    b.gt    2b
+    add     x11, x11, #4
+    b       1b
+9:  ret
+
+#if defined(__APPLE__)
+// void a_matmul_amx(float* out, const float* xT, const float* wp, const float* bias,
+//                   long n, long C, long OC, long ldo)
+// wp: 16-channel panels from a_pack_weights. n <= 64, OC % 16 == 0.
+// fma32 (matrix mode): Z[4j + z][i] += X[i] * Y[j]. Row r of the tile is Z row 4 (r % 16) + r / 16.
+FUNC SYM(a_matmul_amx)
+    stp     x29, x30, [sp, #-96]!
+    mov     x29, sp
+    SAVE_X19_X28
+    mov     x19, x0
+    mov     x20, x1
+    mov     x21, x2
+    mov     x22, x3
+    mov     x23, x4
+    mov     x24, x5
+    mov     x25, x6
+    lsl     x26, x7, #2
+    AMX_SET
+    mov     x12, #0
+    movz    x13, #0x11, lsl #16
+    movz    x14, #0x22, lsl #16
+    movz    x15, #0x33, lsl #16
+    mov     x16, #1
+    lsl     x16, x16, #62
+    movz    x17, #0x4200, lsl #48
+    LOADADDR x27, amx_zeros
+    mov     x7, #0
+1:  cmp     x7, x25
+    b.ge    9f
+    mov     x9, x27
+    cbz     x22, 2f
+    add     x9, x22, x7, lsl #2
+2:  mov     x10, #0
+3:  orr     x11, x9, x10, lsl #56
+    AMXOP   4, 11
+    add     x10, x10, #1
+    cmp     x10, #64
+    b.lt    3b
+    mul     x0, x7, x24
+    add     x0, x21, x0, lsl #2
+    mov     x1, x20
+    mov     x2, x24
+4:  AMXOP   0, 0
+    orr     x3, x1, x16
+    AMXOP   1, 3
+    add     x4, x1, #128
+    orr     x4, x4, x17
+    AMXOP   1, 4
+    AMXOP   12, 12
+    AMXOP   12, 13
+    AMXOP   12, 14
+    AMXOP   12, 15
+    add     x0, x0, #64
+    add     x1, x1, #256
+    subs    x2, x2, #1
+    b.gt    4b
+    mov     x10, #0
+5:  cmp     x10, x23
+    b.ge    6f
+    and     x11, x10, #15
+    lsl     x11, x11, #2
+    add     x11, x11, x10, lsr #4
+    madd    x9, x10, x26, x19
+    add     x9, x9, x7, lsl #2
+    orr     x9, x9, x11, lsl #56
+    AMXOP   5, 9
+    add     x10, x10, #1
+    b       5b
+6:  add     x7, x7, #16
+    b       1b
+9:  AMX_CLR
+    RESTORE_X19_X28
+    ldp     x29, x30, [sp], #96
+    ret
+#endif
+
+// ===========================================================================
 // model// ===========================================================================
 // model
 
@@ -3030,6 +3183,23 @@ FUNC SYM(gpt2a_build_from_checkpoint)
     b.ne    7f
     bl      pack16_all
     b       8f
+    MOV32   w10, 0x00786d61             // "amx"
+    cmp     w9, w10
+    b.ne    6f
+    tst     x21, #15
+    b.ne    7f
+#if defined(__APPLE__)
+    bl      pack_all
+    mov     x9, #4
+    str     x9, [x20, #G_PACKED]
+    LOADADDR x0, s_precamx
+    bl      pr0
+    b       8f
+#else
+    LOADADDR x0, s_noamx
+    bl      pr0
+    b       7f
+#endif
 6:  MOV32   w10, 0x38746e69             // "int8"
     cmp     w9, w10
     b.ne    7f
@@ -3100,6 +3270,13 @@ FUNC SYM(gpt2a_alloc_acts)
     lsl     x0, x0, #2
     bl      xmalloc
     str     x0, [x19, #G_ACT_XS]
+    ldr     x0, [x19, #G_C]             // AMX: 64 rows x 4C, plus room to align to 128
+    lsl     x0, x0, #10
+    add     x0, x0, #128
+    bl      xmalloc
+    add     x0, x0, #127
+    and     x0, x0, #~127
+    str     x0, [x19, #G_ACT_XT]
     RESTORE_X19_X28
     ldp     x29, x30, [sp], #96
     ret
@@ -3537,6 +3714,10 @@ pool_run:
 pmatmul:                                // (out, inp, weight, bias, N, C, OC)
     LOADADDR x9, G
     ldr     x10, [x9, #G_PACKED]
+#if defined(__APPLE__)
+    cmp     x10, #4
+    b.eq    pmatmul_amx
+#endif
     cmp     x10, #3
     b.eq    2f
     cmp     x10, #2
@@ -3585,6 +3766,52 @@ pmatmul:                                // (out, inp, weight, bias, N, C, OC)
 1:  SET_TASK
     LOADADDR x0, par_matmul
     b       pool_run
+#if defined(__APPLE__)
+// AMX: for each block of up to 64 rows, transpose the input, then split channels over threads
+    .p2align 4
+pmatmul_amx:
+    stp     x29, x30, [sp, #-96]!
+    mov     x29, sp
+    SAVE_X19_X28
+    mov     x19, x0                     // out
+    mov     x20, x1                     // inp
+    mov     x21, x2                     // weight
+    mov     x22, x3                     // bias
+    mov     x23, x4                     // N
+    mov     x24, x5                     // C
+    mov     x25, x6                     // OC
+    mov     x26, #0                     // first row of the block
+1:  cmp     x26, x23
+    b.ge    9f
+    sub     x27, x23, x26
+    mov     x9, #64
+    cmp     x27, x9
+    csel    x27, x9, x27, gt            // rows in this block
+    LOADADDR x9, G
+    ldr     x0, [x9, #G_ACT_XT]
+    mul     x10, x26, x24
+    add     x1, x20, x10, lsl #2
+    mov     x2, x27
+    mov     x3, x24
+    bl      SYM(a_transpose64)
+    mul     x10, x26, x25
+    add     x0, x19, x10, lsl #2        // out rows of this block
+    mov     x1, x20                     // (replaced by G_ACT_XT in par_matmul)
+    mov     x2, x21
+    mov     x3, x22
+    mov     x4, x27
+    mov     x5, x24
+    mov     x6, x25
+    SET_TASK
+    LOADADDR x0, par_matmul
+    bl      pool_run
+    add     x26, x26, #64
+    b       1b
+9:  RESTORE_X19_X28
+    ldp     x29, x30, [sp], #96
+    ret
+#endif
+
     .p2align 4
 pattention:                             // (out, qkv, scratch, B, T, C, NH)
     SET_TASK
@@ -3641,7 +3868,16 @@ par_matmul:
     b.eq    4f
     cmp     x16, #3
     b.eq    5f
+#if defined(__APPLE__)
+    cmp     x16, #4
+    b.eq    6f
+#endif
     b       SYM(a_matmul_packed)
+#if defined(__APPLE__)
+6:  LOADADDR x9, G                      // AMX: input already transposed into G_ACT_XT
+    ldr     x1, [x9, #G_ACT_XT]
+    b       SYM(a_matmul_amx)
+#endif
 5:  ldr     x5, [x15, #40]              // int8: panels of 16 C + 64 bytes
     ldr     x2, [x15, #16]
     lsr     x9, x13, #4

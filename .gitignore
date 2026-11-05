@@ -15,3 +15,10 @@ gpt2asm/llm.c/
 gpt2asm/_to_delete/
 llmc_gpt2_arm64.zip
 .DS_Store
+# native macOS binaries (built by native/build.sh and amx/build.sh)
+gpt2asm/native/gpt2
+gpt2asm/native/gpt2_profile
+gpt2asm/amx/amx_probe
+gpt2asm/amx/amx_mm_test
+gpt2asm/amx/amx_probe.txt
+*.o

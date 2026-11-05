@@ -1,0 +1,13 @@
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ arm64-macos ]
+install-name:    '/usr/lib/libSystem.B.dylib'
+current-version: 1319
+compatibility-version: 1
+exports:
+  - targets:     [ arm64-macos ]
+    symbols:     [ _printf, _puts, _putchar, _fflush, _fopen, _fread, _fclose, _malloc, _free,
+                   _calloc, _atoi, _getenv, _sysconf, _clock, _clock_gettime, _exit,
+                   _pthread_create, _pthread_join, _memset, _memcpy, _sysctlbyname,
+                   _expf, _tanhf, dyld_stub_binder ]
+...
