@@ -9,5 +9,5 @@ exports:
     symbols:     [ _printf, _puts, _putchar, _fflush, _fopen, _fread, _fclose, _malloc, _free,
                    _calloc, _atoi, _getenv, _sysconf, _clock, _clock_gettime, _exit,
                    _pthread_create, _pthread_join, _memset, _memcpy, _sysctlbyname,
-                   _expf, _tanhf, _logf, _fork, _waitpid, _pthread_set_qos_class_self_np, dyld_stub_binder ]
+                   _expf, _tanhf, _logf, _fork, _waitpid, _pthread_set_qos_class_self_np, _strcmp, dyld_stub_binder ]
 ...

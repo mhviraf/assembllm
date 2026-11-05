@@ -292,6 +292,15 @@
     fadd    v11.4s, v11.4s, v3.4s
     st1     {v8.4s, v9.4s, v10.4s, v11.4s}, [x9]
 .endm
+// FOLD32I: the same for panels in AMX lane order (lane i = channel 16 (i % 2) + i / 2):
+// even lanes are channels 0-15, odd lanes 16-31
+.macro FOLD32I a, b, c, d
+    uzp1    v4.8h, \a\().8h, \b\().8h
+    uzp1    v5.8h, \c\().8h, \d\().8h
+    uzp2    v6.8h, \a\().8h, \b\().8h
+    uzp2    v7.8h, \c\().8h, \d\().8h
+    FOLD32  v4, v5, v6, v7
+.endm
 
 // int8 5x16 kernel: one group of 4 k (lane g of inputs v0-v4) times 16 channels (v8-v11)
 .macro SDOT20 g
@@ -478,7 +487,17 @@
 .equ G_KV_ON,       2536     // 1 during gpt2a_forward_kv
 .equ G_KV_POS0,     2544     // gpt2a_forward_kv: position of the first new token
 .equ G_ATT_T0,      2552     // attention: first query position computed (0 = all)
-.equ G_SIZE,        2560
+.equ G_BAR,         2560     // AMX matmul: parts done with their slice of the transpose (own line)
+.equ G_AMX_PFD,     2688     // AMX: weight prefetch distance in bytes (GPT2A_AMX_PF, default 8192)
+.equ G_FUSE_GELU,   2696     // AMX: apply GELU to each matmul slice right after computing it
+.equ G_MM_EFF,      2704     // kernel family for the current pmatmul (G_PACKED, or NEON for few rows)
+.equ AMX_MIN_ROWS,  16       // fewer rows than this: AMX tiles would be mostly empty, use NEON
+.equ G_NE,          2712     // AMX: extra pool threads on the efficiency cores (GPT2A_AMX_E)
+.equ G_ESHARE,      2720     // AMX: percent of each matmul's channels they take (GPT2A_AMX_ESHARE)
+.equ G_NTOTAL,      2728     // pool threads this forward pass: G_NTHREADS + G_NE
+.equ G_POOL_PARTS,  2736     // parts in the current pool generation
+.equ G_EQOS,        2744     // QoS class of the E-core helpers (GPT2A_AMX_EQOS, default 0x11 utility)
+.equ G_SIZE,        2816
 .equ NPROF,         12
 .equ KC16,          64       // fp16 accumulation block before folding into fp32
 .equ MAX_THREADS,   64
@@ -584,6 +603,10 @@ s_precamx:       .asciz "precision: fp32 on the AMX matrix coprocessor\n"
 s_precamxh:      .asciz "precision: fp16 weights and matmul inputs on the AMX matrix coprocessor, fp32 sums\n"
 s_noamx:         .asciz "note: amx needs native macOS on Apple silicon; using fp32 NEON\n"
 s_env_amxthr:    .asciz "GPT2A_AMX_THREADS"
+s_env_amxpf:     .asciz "GPT2A_AMX_PF"
+s_env_amxe:      .asciz "GPT2A_AMX_E"
+s_env_amxes:     .asciz "GPT2A_AMX_ESHARE"
+s_env_amxeq:     .asciz "GPT2A_AMX_EQOS"
 s_amx32:         .asciz "amx kernel: 32 x 32 tiles\n"
 s_amx16:         .asciz "amx kernel: 16 x 64 tiles\n"
 s_amxr0:         .asciz "amx kernel: 16 x 64 tiles, X0 / Y0 only\n"
@@ -2188,6 +2211,9 @@ h_chunk:
     subs    x9, x9, #8
     b.gt    5b
 6:  // fold the fp16 block sums into the fp32 output rows
+    LOADADDR x11, G
+    ldr     x11, [x11, #G_F16I]
+    cbnz    x11, 60f
     mov     x9, x7
     FOLD32  v12, v13, v14, v15
     cmp     x5, #1
@@ -2207,6 +2233,26 @@ h_chunk:
     b.le    7f
     add     x9, x7, x26, lsl #2
     FOLD32  v28, v29, v30, v31
+    b       7f
+60: mov     x9, x7                      // panels in AMX lane order (amx16 with few rows)
+    FOLD32I v12, v13, v14, v15
+    cmp     x5, #1
+    b.le    7f
+    add     x9, x7, x26
+    FOLD32I v16, v17, v18, v19
+    cmp     x5, #2
+    b.le    7f
+    add     x9, x7, x26, lsl #1
+    FOLD32I v20, v21, v22, v23
+    cmp     x5, #3
+    b.le    7f
+    add     x9, x7, x26, lsl #1
+    add     x9, x9, x26
+    FOLD32I v24, v25, v26, v27
+    cmp     x5, #4
+    b.le    7f
+    add     x9, x7, x26, lsl #2
+    FOLD32I v28, v29, v30, v31
 7:  cbnz    x6, h_chunk
     add     x27, x27, #5
     b       h_rblk
@@ -3003,8 +3049,11 @@ calibrate:
 
 // void a_transpose64(float* xT, const float* x, long n, long C)
 // xT[k*64 + r] = x[min(r, n-1)*C + k] for r < round_up(n, 4). Needs C % 4 == 0, n <= 64.
+// a_transpose64_s(xT, x, n, kc, ld): the same for kc columns of rows ld floats apart.
 FUNC SYM(a_transpose64)
-    lsl     x9, x3, #2
+    mov     x4, x3
+FUNC SYM(a_transpose64_s)
+    lsl     x9, x4, #2
     sub     x10, x2, #1
     mov     x11, #0
 1:  cmp     x11, x2
@@ -3049,8 +3098,11 @@ FUNC SYM(a_transpose64)
 
 // void a_transpose64_h(uint16_t* xT, const float* x, long n, long C)
 // xT[k*64 + r] = fp16(x[min(r, n-1)*C + k]) for r < round_up(n, 4). Needs C % 4 == 0, n <= 64.
+// a_transpose64_hs(xT, x, n, kc, ld): the same for kc columns of rows ld floats apart.
 FUNC SYM(a_transpose64_h)
-    lsl     x9, x3, #2
+    mov     x4, x3
+FUNC SYM(a_transpose64_hs)
+    lsl     x9, x4, #2
     sub     x10, x2, #1
     mov     x11, #0
 1:  cmp     x11, x2
@@ -3143,6 +3195,8 @@ FUNC SYM(a_matmul_amx32)
     lsl     x16, x16, #56               // register index 1
     LOADADDR x27, amx_zeros
     lsl     x28, x24, #6                // panel bytes
+    LOADADDR x3, G
+    ldr     x3, [x3, #G_AMX_PFD]        // prefetch distance
     mov     x7, #0                      // o
 1:  cmp     x7, x25
     b.ge    9f
@@ -3174,11 +3228,11 @@ FUNC SYM(a_matmul_amx32)
     csel    x9, xzr, x9, lt
     add     x1, x0, x9
     orr     x1, x1, x16
-    add     x9, x9, #AMX_PF
+    add     x9, x9, x3
     add     x2, x20, x6, lsl #2         // xT rows h..h+31 (128-byte aligned)
     orr     x2, x2, x16, lsl #6         // pair
     mov     x4, x24
-4:  prfm    pldl2keep, [x0, #AMX_PF]
+4:  prfm    pldl2keep, [x0, x3]
     prfm    pldl2keep, [x0, x9]
     AMXOP   0, 0                        // X0 <- W[o .. o+15][k]
     AMXOP   0, 1                        // X1 <- W[o+16 .. o+31][k]
@@ -3400,6 +3454,8 @@ FUNC SYM(a_matmul_amxh)
     lsl     x12, x12, #62               // fma16: fp32 Z, X0 x Y0
     LOADADDR x27, amx_zeros
     lsl     x28, x24, #6                // panel bytes: C x 32 halves
+    LOADADDR x1, G
+    ldr     x1, [x1, #G_AMX_PFD]        // prefetch distance
     mov     x7, #0                      // o
 1:  cmp     x7, x25
     b.ge    9f
@@ -3423,7 +3479,7 @@ FUNC SYM(a_matmul_amxh)
     add     x0, x21, x0                 // panel o / 32
     add     x2, x20, x6, lsl #1         // inputs h..h+31
     mov     x4, x24
-4:  prfm    pldl2keep, [x0, #AMX_PF]
+4:  prfm    pldl2keep, [x0, x1]
     AMXOP   0, 0
     AMXOP   1, 2
     AMXOP   15, 12
@@ -3471,6 +3527,38 @@ amx_parts_env:
     sxtw    x9, w0
 1:  LOADADDR x10, G
     str     x9, [x10, #G_AMX_PARTS]
+    LOADADDR x0, s_env_amxpf            // and the weight prefetch distance
+    bl      SYM(getenv)
+    mov     x9, #8192
+    cbz     x0, 2f
+    bl      SYM(atoi)
+    sxtw    x9, w0
+2:  LOADADDR x10, G
+    str     x9, [x10, #G_AMX_PFD]
+    LOADADDR x0, s_env_amxe             // E-core AMX helper threads (default 0)
+    bl      SYM(getenv)
+    mov     x9, #0
+    cbz     x0, 3f
+    bl      SYM(atoi)
+    sxtw    x9, w0
+3:  LOADADDR x10, G
+    str     x9, [x10, #G_NE]
+    LOADADDR x0, s_env_amxes            // and their share of the channels, percent (default 30)
+    bl      SYM(getenv)
+    mov     x9, #30
+    cbz     x0, 4f
+    bl      SYM(atoi)
+    sxtw    x9, w0
+4:  LOADADDR x10, G
+    str     x9, [x10, #G_ESHARE]
+    LOADADDR x0, s_env_amxeq            // their QoS class (0x09 background, 0x11 utility, ...)
+    bl      SYM(getenv)
+    mov     x9, #0x11
+    cbz     x0, 5f
+    bl      SYM(atoi)
+    sxtw    x9, w0
+5:  LOADADDR x10, G
+    str     x9, [x10, #G_EQOS]
     ldp     x29, x30, [sp], #16
     ret
 
@@ -4058,14 +4146,20 @@ fwd_layer:
     mul     x13, x24, x27
     add     x13, x13, x23, lsl #1
     MMHOOK  x1, x22, x23, x13
+    mov     x9, #1                      // AMX matmuls apply GELU to their own slice
+    str     x9, [x28, #G_FUSE_GELU]
     bl      pmatmul
+    str     xzr, [x28, #G_FUSE_GELU]
     PROFTICK x28, 6
-    // gelu, in place
+    // gelu, in place (already done if the matmul ran on AMX)
+    ldr     x9, [x28, #G_MM_EFF]
+    cmp     x9, #4
+    b.ge    1f
     ldr     x0, [x28, #G_ACT_FCH]
     mov     x1, x0
     mul     x2, x22, x26
     bl      pgelu
-    PROFTICK x28, 7
+1:  PROFTICK x28, 7
     // MLP down
     mul     x9, x25, x26
     ldr     x0, [x28, #G_ACT_PROJ]
@@ -4234,8 +4328,15 @@ pool_start:
     LOADADDR x19, G
     str     xzr, [x19, #G_POOL_GEN]
     str     xzr, [x19, #G_POOL_DONE]
+    ldr     x9, [x19, #G_NTHREADS]      // workers: the n - 1 others, plus any E-core AMX helpers
+    ldr     x10, [x19, #G_NE]
+    add     x9, x9, x10
+    mov     x10, #MAX_THREADS
+    cmp     x9, x10
+    csel    x9, x10, x9, gt
+    str     x9, [x19, #G_NTOTAL]
     mov     x20, #1
-1:  ldr     x9, [x19, #G_NTHREADS]
+1:  ldr     x9, [x19, #G_NTOTAL]
     cmp     x20, x9
     b.ge    3f
     add     x0, x19, #G_TIDS
@@ -4260,16 +4361,18 @@ pool_stop:
     mov     x29, sp
     stp     x19, x20, [sp, #16]
     LOADADDR x19, G
-    ldr     x9, [x19, #G_NTHREADS]
+    ldr     x9, [x19, #G_NTOTAL]
     cmp     x9, #1
     b.le    3f
     str     xzr, [x19, #G_POOL_FN]
     add     x10, x19, #G_POOL_GEN
     ldr     x11, [x10]
+    lsr     x11, x11, #8
     add     x11, x11, #1
+    orr     x11, x9, x11, lsl #8        // every thread takes part (and exits)
     stlr    x11, [x10]                  // release: fn = 0 is visible first
     mov     x20, #1
-1:  ldr     x9, [x19, #G_NTHREADS]
+1:  ldr     x9, [x19, #G_NTOTAL]
     cmp     x20, x9
     b.ge    3f
     add     x9, x19, #G_TIDS
@@ -4290,13 +4393,17 @@ worker_main:
     stp     x19, x20, [sp, #16]
     stp     x21, x22, [sp, #32]
     mov     x19, x0                     // id
+    LOADADDR x20, G
 #if defined(__APPLE__)
     mov     w0, #0x21                   // QOS_CLASS_USER_INTERACTIVE, like the main thread
+    ldr     x9, [x20, #G_NTHREADS]
+    cmp     x19, x9
+    ldr     x9, [x20, #G_EQOS]          // E-core AMX helpers: a lower QoS class
+    csel    w0, w9, w0, ge
     mov     w1, #0
     bl      SYM(pthread_set_qos_class_self_np)
 #endif
-    LOADADDR x20, G
-    mov     x21, #0                     // last generation seen
+    mov     x21, #0                     // last generation word seen
 1:  add     x10, x20, #G_POOL_GEN
 2:  ldar    x9, [x10]                   // acquire: task and fn are visible
     cmp     x9, x21
@@ -4304,6 +4411,9 @@ worker_main:
     yield
     b       2b
 3:  mov     x21, x9
+    and     x9, x9, #0xff               // threads taking part in this generation
+    cmp     x19, x9
+    b.ge    1b
     ldr     x9, [x20, #G_POOL_FN]
     cbz     x9, 9f
     mov     x0, x19
@@ -4320,26 +4430,33 @@ worker_main:
     ldp     x29, x30, [sp], #48
     ret
 
-// pool_run(fn): run fn(0) here and fn(1..n-1) on the workers, wait for all
+// pool_run(fn): run fn(0) here and fn(1..n-1) on the workers (n = G_NTHREADS), wait for all.
+// pool_run_n(fn, n): the same with n parts (up to G_NTOTAL, to include the E-core helpers).
+// The generation word is (counter << 8) | n; workers with id >= n sit the generation out.
     .p2align 4
 pool_run:
+    LOADADDR x9, G
+    ldr     x1, [x9, #G_NTHREADS]
+pool_run_n:
     stp     x29, x30, [sp, #-32]!
     mov     x29, sp
     stp     x19, x20, [sp, #16]
     LOADADDR x19, G
     mov     x20, x0
-    ldr     x9, [x19, #G_NTHREADS]
-    cmp     x9, #1
+    str     x1, [x19, #G_POOL_PARTS]
+    cmp     x1, #1
     b.le    2f
     str     x20, [x19, #G_POOL_FN]
     str     xzr, [x19, #G_POOL_DONE]
     add     x10, x19, #G_POOL_GEN
     ldr     x11, [x10]
+    lsr     x11, x11, #8
     add     x11, x11, #1
+    orr     x11, x1, x11, lsl #8
     stlr    x11, [x10]                  // release: fn, task, done = 0 visible first
 2:  mov     x0, #0
     blr     x20
-    ldr     x9, [x19, #G_NTHREADS]
+    ldr     x9, [x19, #G_POOL_PARTS]
     cmp     x9, #1
     b.le    4f
     sub     x9, x9, #1
@@ -4371,8 +4488,15 @@ pmatmul:                                // (out, inp, weight, bias, N, C, OC)
     ldr     x10, [x9, #G_PACKED]
 #if defined(__APPLE__)
     cmp     x10, #4
-    b.ge    pmatmul_amx                 // 4: fp32 AMX, 5: fp16 AMX
+    b.lt    0f
+    cmp     x4, #AMX_MIN_ROWS
+    b.lt    01f
+    str     x10, [x9, #G_MM_EFF]
+    b       pmatmul_amx                 // 4: fp32 AMX, 5: fp16 AMX
+01: sub     x10, x10, #3                // few rows: NEON on the same panels (4 -> fp32, 5 -> fp16)
+0:
 #endif
+    str     x10, [x9, #G_MM_EFF]
     cmp     x10, #3
     b.eq    2f
     cmp     x10, #2
@@ -4422,7 +4546,8 @@ pmatmul:                                // (out, inp, weight, bias, N, C, OC)
     LOADADDR x0, par_matmul
     b       pool_run
 #if defined(__APPLE__)
-// AMX: for each block of up to 64 rows, transpose the input, then split channels over threads
+// AMX: for each block of up to 64 rows, one pool task (par_amx_mm) in which every thread
+// transposes a slice of the input's columns, waits for the others, then runs its channels.
     .p2align 4
 pmatmul_amx:
     stp     x29, x30, [sp, #-96]!
@@ -4443,22 +4568,15 @@ pmatmul_amx:
     cmp     x27, x9
     csel    x27, x9, x27, gt            // rows in this block
     LOADADDR x9, G
-    ldr     x0, [x9, #G_ACT_XT]
-    mul     x10, x26, x24
-    add     x1, x20, x10, lsl #2
-    mov     x2, x27
-    mov     x3, x24
-    LOADADDR x9, G
-    ldr     x10, [x9, #G_PACKED]
-    cmp     x10, #5
-    b.eq    2f
-    bl      SYM(a_transpose64)
-    b       21f
-2:  bl      SYM(a_transpose64_h)            // fp16 AMX: transposed fp16 copy
-21: LOADADDR x9, G
     ldr     x10, [x9, #G_AMX_FN]
     cbnz    x10, 4f
-    cmp     x25, #64                    // first use: pick a kernel that agrees with NEON
+    // first use (fp32 AMX): transpose here and pick a kernel that agrees with NEON
+    ldr     x0, [x9, #G_ACT_XT]
+    mov     x1, x20
+    mov     x2, x27
+    mov     x3, x24
+    bl      SYM(a_transpose64)
+    cmp     x25, #64
     b.lt    3f
     mov     x0, x20
     mov     x1, x21
@@ -4480,21 +4598,167 @@ pmatmul_amx:
     RESTORE_X19_X28
     ldp     x29, x30, [sp], #96
     b       pmatmul
-4:  mul     x10, x26, x25
+4:  LOADADDR x9, G
+    str     xzr, [x9, #G_BAR]
+    mul     x10, x26, x25
     add     x0, x19, x10, lsl #2        // out rows of this block
-    mov     x1, x20                     // (replaced by G_ACT_XT in par_matmul)
+    mul     x10, x26, x24
+    add     x1, x20, x10, lsl #2        // input rows of this block
     mov     x2, x21
     mov     x3, x22
     mov     x4, x27
     mov     x5, x24
     mov     x6, x25
     SET_TASK
-    LOADADDR x0, par_matmul
-    bl      pool_run
+    LOADADDR x0, par_amx_mm
+    LOADADDR x9, G
+    ldr     x1, [x9, #G_NTOTAL]         // performance-core threads plus any E-core helpers
+    bl      pool_run_n
     add     x26, x26, #64
     b       1b
 9:  RESTORE_X19_X28
     ldp     x29, x30, [sp], #96
+    ret
+
+// part p of an AMX matmul block. Parts below G_NTHREADS (performance cores) transpose input
+// columns [k0, k1) into G_ACT_XT (fp32 or fp16); then every part waits at a barrier; then
+// each takes a slice of the output channels. The performance-core parts share the first
+// (100 - G_ESHARE)% of the channels (only G_AMX_PARTS of them, if set); the E-core helpers,
+// if any, share the rest. With G_FUSE_GELU, each part then applies GELU to its own slice.
+    .p2align 4
+par_amx_mm:
+    stp     x29, x30, [sp, #-64]!
+    mov     x29, sp
+    stp     x19, x20, [sp, #16]
+    stp     x21, x22, [sp, #32]
+    stp     x23, x24, [sp, #48]
+    mov     x19, x0
+    LOADADDR x20, G
+    add     x21, x20, #G_TASK
+    ldr     x22, [x21, #40]             // C
+    ldr     x10, [x20, #G_NTHREADS]
+    cmp     x19, x10
+    b.ge    5f                          // E-core helpers don't transpose
+    add     x12, x22, x10
+    sub     x12, x12, #1
+    udiv    x12, x12, x10
+    add     x12, x12, #3
+    and     x12, x12, #~3               // columns per part
+    mul     x13, x19, x12               // k0
+    cmp     x13, x22
+    b.ge    5f
+    add     x14, x13, x12
+    cmp     x14, x22
+    csel    x14, x22, x14, gt           // k1
+    ldr     x0, [x20, #G_ACT_XT]
+    ldr     x1, [x21, #8]
+    add     x1, x1, x13, lsl #2         // input column k0
+    ldr     x2, [x21, #32]              // rows
+    sub     x3, x14, x13
+    mov     x4, x22
+    ldr     x9, [x20, #G_PACKED]
+    cmp     x9, #5
+    b.eq    4f
+    add     x0, x0, x13, lsl #8         // xT + k0 * 64 floats
+    bl      SYM(a_transpose64_s)
+    b       5f
+4:  add     x0, x0, x13, lsl #7         // xT16 + k0 * 64 halves
+    bl      SYM(a_transpose64_hs)
+5:  add     x10, x20, #G_BAR            // barrier: every part has done its columns
+6:  ldxr    x11, [x10]
+    add     x11, x11, #1
+    stlxr   w12, x11, [x10]
+    cbnz    w12, 6b
+    ldr     x13, [x20, #G_POOL_PARTS]
+7:  ldar    x11, [x10]
+    cmp     x11, x13
+    b.ge    8f
+    yield
+    b       7b
+8:  // channel slice [x22, x22 + x23)
+    ldr     x10, [x20, #G_NTHREADS]
+    ldr     x17, [x20, #G_AMX_PARTS]
+    cmp     x17, #0
+    ccmp    x17, x10, #0, gt
+    csel    x17, x17, x10, lt           // performance-core parts that compute
+    ldr     x11, [x21, #48]             // OC
+    mov     x14, x11                    // channels for the performance cores
+    ldr     x15, [x20, #G_NE]
+    cbz     x15, 9f
+    ldr     x9, [x20, #G_ESHARE]
+    mov     x12, #100
+    sub     x9, x12, x9
+    mul     x14, x11, x9
+    udiv    x14, x14, x12
+    add     x14, x14, #31
+    and     x14, x14, #~31
+    cmp     x14, x11
+    csel    x14, x11, x14, gt
+9:  cmp     x19, x10
+    b.ge    10f
+    mov     x9, x19                     // performance-core part: [0, x14) over x17 parts
+    mov     x12, x14
+    mov     x13, #0
+    b       11f
+10: sub     x9, x19, x10                // E-core part: [x14, OC) over x15 parts
+    sub     x12, x11, x14
+    mov     x13, x14
+    mov     x17, x15
+11: cmp     x9, x17
+    b.ge    30f
+    cbz     x12, 30f
+    add     x16, x12, x17
+    sub     x16, x16, #1
+    udiv    x16, x16, x17
+    add     x16, x16, #31
+    and     x16, x16, #~31              // chunk
+    madd    x22, x9, x16, x13           // oA
+    add     x12, x12, x13               // end of the region
+    cmp     x22, x12
+    b.ge    30f
+    add     x23, x22, x16
+    cmp     x23, x12
+    csel    x23, x12, x23, gt
+    sub     x23, x23, x22               // channels in the slice
+    ldr     x0, [x21, #0]
+    add     x0, x0, x22, lsl #2         // out + oA
+    ldr     x1, [x20, #G_ACT_XT]
+    ldr     x2, [x21, #16]
+    ldr     x5, [x21, #40]              // C
+    mul     x9, x22, x5
+    lsl     x9, x9, #1                  // oA * C halves (fp16 AMX) ...
+    ldr     x10, [x20, #G_PACKED]
+    cmp     x10, #5
+    b.eq    12f
+    lsl     x9, x9, #1                  // ... or floats (fp32 AMX)
+12: add     x2, x2, x9
+    ldr     x3, [x21, #24]
+    cbz     x3, 13f
+    add     x3, x3, x22, lsl #2
+13: ldr     x4, [x21, #32]              // rows
+    mov     x6, x23
+    mov     x7, x11                     // ldo = OC
+    ldr     x9, [x20, #G_AMX_FN]
+    blr     x9
+    ldr     x9, [x20, #G_FUSE_GELU]
+    cbz     x9, 30f
+    ldr     x9, [x21, #0]
+    add     x19, x9, x22, lsl #2        // &out[0][oA]
+    ldr     x20, [x21, #48]
+    lsl     x20, x20, #2                // row bytes
+    ldr     x21, [x21, #32]             // rows
+20: cbz     x21, 30f
+    mov     x0, x19
+    mov     x1, x19
+    mov     x2, x23
+    bl      SYM(a_gelu_forward)
+    add     x19, x19, x20
+    sub     x21, x21, #1
+    b       20b
+30: ldp     x19, x20, [sp, #16]
+    ldp     x21, x22, [sp, #32]
+    ldp     x23, x24, [sp, #48]
+    ldp     x29, x30, [sp], #64
     ret
 #endif
 
@@ -4520,7 +4784,7 @@ psoftmax:                               // (probs, logits, N, V, Vp)
     .p2align 4
 par_matmul:
     LOADADDR x9, G
-    ldr     x16, [x9, #G_PACKED]
+    ldr     x16, [x9, #G_MM_EFF]
     ldr     x10, [x9, #G_NTHREADS]
 #if defined(__APPLE__)
     cmp     x16, #4                     // AMX: only G_AMX_PARTS threads take a slice
@@ -5123,6 +5387,11 @@ gen_done:
 // test hook: a_matmul_q8 with an explicit row-scale array (9th argument on the stack is
 // avoided: scales passed in G_ACT_XS). void a_matmul_q8_test(out, xq, wq, bias, N, C, OC, ldo, xs)
 #if defined(GPT2A_NO_MAIN)
+// test hook: void a_set_f16i(long on) sets the fp16 panel lane order flag (G_F16I)
+FUNC SYM(a_set_f16i)
+    LOADADDR x9, G
+    str     x0, [x9, #G_F16I]
+    ret
 FUNC SYM(a_matmul_q8_test)
     ldr     x9, [sp]                    // 9th argument (stack on both ABIs)
     LOADADDR x10, G

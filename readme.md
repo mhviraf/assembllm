@@ -38,23 +38,25 @@ These runs are native macOS on the same MacBook Air (M1), built without Xcode (s
 |---|---|---|---|---|
 | fp32, NEON | 49.8 | 1,284 | 1× | 5.2520 |
 | fp16, NEON | 28.0 | 2,286 | 1.78× | 5.2499 |
-| **fp32, AMX** (`amx`) | 30.0 | 2,135 | **1.66×** | 5.2520 (identical) |
-| **fp16 with fp32 sums, AMX** (`amx16`) | 18.3 | 3,501 | **2.72×** | 5.2519 |
-| int8, NEON (SmoothQuant) | 14.4 | 4,434 | 3.45× | 5.2686 |
+| **fp32, AMX** (`amx`) | 26.9 | 2,380 | **1.85×** | 5.2520 (identical) |
+| **fp16 with fp32 sums, AMX** (`amx16`) | 17.4 | 3,685 | **2.86×** | 5.2519 |
+| int8, NEON (SmoothQuant) | 13.9 | 4,616 | 3.58× | 5.2686 |
 
-`amx16` is the fastest mode that keeps fp32's loss: int8 is about 25% faster but adds 0.017 nats.
+`amx16` is the fastest mode that keeps fp32's loss: int8 is about 25% faster but adds 0.017 nats. Back-to-back runs of the same mode on the fanless Air vary by about ±1 ms (amx16: 17.0–18.6 ms).
 
 ## Generating text
 
 `gpt2` samples text from `<|endoftext|>` with llm.c's RNG and prints exactly what llm.c's sampling loop prints. llm.c reruns the whole sequence for every new token, so token t costs a forward pass over t positions. The assembly keeps a KV cache instead: every layer's q, k, v rows stay in memory (about 9 MB per layer per 1,000 tokens, 113 MB for all 12 layers at the full 1,024), and each step runs only the newest token through the model (`gpt2a_forward_kv`). The math per position is unchanged, and the generated text is byte-identical.
 
-Each token then costs one pass over the weights, so generation is limited by memory bandwidth, and smaller weights help most. These numbers are for 256 tokens on 4 threads in the Linux VM:
+Each token then costs one pass over the weights, so generation is limited by memory bandwidth, and smaller weights help most. These numbers are for 256 tokens on 4 threads:
 
-| Precision | Tokens/s | Weights read per token |
-|---|---|---|
-| fp32 | 82 | 500 MB |
-| fp16 | 142 | 250 MB |
-| int8 | 291 | 125 MB |
+| Precision | Tokens/s, native macOS | Tokens/s, Linux VM | Weights read per token |
+|---|---|---|---|
+| fp32 (also `amx`) | 92 | 82 | 500 MB |
+| fp16 (also `amx16`) | 174 | 142 | 250 MB |
+| int8 | 324 | 291 | 125 MB |
+
+AMX doesn't help here. Its smallest tile is 32 × 32, so a one-token matmul would leave 31 of 32 rows empty. In the AMX modes, matmuls with fewer than 16 rows run on the NEON kernels instead, reading the same packed weights.
 
 Before the cache, 63 tokens took about 2 s of wall time in fp32 (7.7 s of CPU time across 4 threads), and each new token got slower. Now they take 0.77 s, and every token costs the same.
 
@@ -141,19 +143,24 @@ The M1 has an undocumented matrix unit, AMX, next to the performance cores' shar
 | 15 | fp32 AMX kernel using only X0 / Y0 (the operand fields the first probe had confirmed), 2 AMX threads | 34.8 (1.40× NEON fp32) | identical |
 | 16 | Operand fields fixed, 128-byte pair loads, CPU prefetch of the weight stream, threads pinned to the performance cores, 4 AMX threads | **30.0** (1.66×) | identical |
 | 17 | fp16 weights and inputs with fp32 sums (`fma16` with fp32 accumulators), weights packed in the lane order AMX writes back | **18.3** (2.72×) | −0.0001 |
+| 18 | Each thread transposes its slice of the matmul input, then waits at a barrier inside the same pool task (before, one thread transposed while three waited). GELU fused into the MLP matmul: each thread applies it to its own channels while they're still in cache. Weight prefetch 8 KB ahead. | amx16 18.3 → **17.4** (2.86×); amx 30.0 → **26.9** (1.85×) | unchanged |
+| 19 | Tried: the efficiency cores' own AMX unit. In isolation it adds a lot: 4 P-core threads plus 4 E-core threads reach 2.2 TFLOP/s against 1.6 for the P cores alone. Giving the E cores 15–40% of each matmul's channels made forward passes 1.6–4× slower at every QoS class tried. Every matmul waits for its slowest part, about 50 times per pass, and the E cores are both slower and slower to wake. Left in as `GPT2A_AMX_E` (off by default). | 29–76 (not used) | – |
 
 14. **Building without Xcode.** `clang -target arm64-apple-macos11` makes Mach-O objects on Linux. `ld64.lld` links them against a text file that lists the libSystem functions used, and signs the result ad hoc. macOS runs it as is.
 15. **Finding out how AMX really behaves.** The first matmul got rows 0–15 right and everything after wrong. A register-by-register probe settled it: `fma32` takes the **Y** offset in bits 0–8 and the **X** offset in bits 10–18, the opposite of what the kernel assumed. Pair loads work, but only from 128-byte-aligned addresses; a 64-byte-aligned one is a bus error. Before the fix was known, a kernel that touches only X0 and Y0 avoided the question and already beat NEON fp32. `pmatmul` checks each AMX kernel against the NEON kernel on first use and keeps the first one that agrees.
 16. **Corrected kernels.** The faster kernels load 128 bytes at once and use all four accumulators. In isolation they reach 1.1–1.4 TFLOP/s, against about 0.4 for NEON on 4 cores. In a real forward pass the weights come from DRAM, and AMX loads alone don't keep enough of them in flight. So each kernel also prefetches its weight stream from the CPU side, and 4 threads issuing AMX work beat 2 (30 vs 39 ms), even though they share one AMX unit.
 17. **fp16 inputs, fp32 sums.** With bit 62 set, `fma16` multiplies 32 fp16 weights by 32 fp16 inputs into a 32 × 32 **fp32** tile. That halves the weight bytes and the load instructions, and each product is exact in fp32. Lane i of output row j lands in Z row 2j + i % 2, column i / 2. Packing each 32-channel panel in the order 0, 16, 1, 17, … makes each Z row hold 16 consecutive channels, so results store straight to memory. Unlike the NEON fp16 path, nothing is summed in fp16, and the loss matches fp32.
+18. **Transpose in parallel, fuse GELU.** AMX needs the input transposed (one row of 64 inputs per k), so each matmul starts with a transpose. For the MLP down-projection (C = 3,072) that is 196,608 values, which one thread took about 30 µs to do. Each thread now does a quarter of the columns. A barrier counter then holds every thread until all slices are in. GELU used to be a separate pass over the 786 KB MLP activation; now each thread applies it to the channels it just computed.
+19. **E cores.** The probe's numbers come from long uninterrupted loops. A forward pass has about 50 matmuls, each split across threads and each ending when the last thread finishes. Threads the scheduler keeps on the E cores run their share more slowly and react later to new work, and that costs more than the extra AMX unit gains.
 
-`amx16` per-stage times (ms per pass): qkv 2.5, attention projection 0.9, MLP 3.3 + 3.6, logits 5.0, everything else 2.8. The matmuls still run about 20% slower than in isolation, where the weights stay cached.
+`amx16` per-stage times (ms per pass): qkv 2.5, attention projection 0.9, MLP up with GELU 4.1, MLP down 3.1, logits 5.1, everything else 1.7.
 
 ### Part 5: generation
 
 | # | Change | Effect |
 |---|---|---|
-| 18 | KV cache: `gpt2a_forward_kv` runs only the new tokens and keeps each layer's q, k, v rows. Attention starts at the first new query (`G_ATT_T0`). The generator's timer uses wall-clock time instead of `clock()`, which added up CPU time across threads. | 63 tokens: 2 s → 0.77 s (fp32, Linux VM, 4 threads), identical text. With 256 tokens: 82 tokens/s fp32, 142 fp16, 291 int8. |
+| 20 | KV cache: `gpt2a_forward_kv` runs only the new tokens and keeps each layer's q, k, v rows. Attention starts at the first new query (`G_ATT_T0`). The generator's timer uses wall-clock time instead of `clock()`, which added up CPU time across threads. | 63 tokens: 2 s → 0.77 s (fp32, Linux VM, 4 threads), identical text. With 256 tokens: 82 tokens/s fp32, 142 fp16, 291 int8. |
+| 21 | In the AMX modes, matmuls with fewer than 16 rows go to the NEON kernels, reading the same packed weights. The NEON fp16 kernel learned AMX's lane order: two `uzp` instructions per 8 channels when it folds its sums into fp32. | Native generation: amx 71 → 92 tokens/s, amx16 126 → 176 (the same as NEON fp32 and fp16) |
 
 ## Reproduce
 

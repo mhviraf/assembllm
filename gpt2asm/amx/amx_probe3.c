@@ -17,6 +17,8 @@ typedef void* pthread_t;
 int pthread_create(pthread_t*, const void*, void* (*)(void*), void*);
 int pthread_join(pthread_t, void**);
 int sysctlbyname(const char*, void*, unsigned long*, void*, unsigned long);
+int pthread_set_qos_class_self_np(int, int);
+int strcmp(const char*, const char*);
 
 void amx_set(void), amx_clr(void);
 void amx_ldx(uint64_t), amx_ldy(uint64_t), amx_stx(uint64_t), amx_sty(uint64_t);
@@ -200,10 +202,11 @@ static void c_f16(int zz) {
 }
 
 // --- 5. throughput
-struct job { int kind; long n; uint64_t a; double secs; float* xb; float* yb; };
-static float bufs[4][3 * 8192 + 64] __attribute__((aligned(256)));
+struct job { int kind; long n; uint64_t a; double secs; float* xb; float* yb; int qos; };
+static float bufs[8][3 * 8192 + 64] __attribute__((aligned(256)));
 static void* worker(void* p) {
     struct job* j = p;
+    if (j->qos) pthread_set_qos_class_self_np(j->qos, 0);
     amx_set();
     double t0 = now();
     if (j->kind == 0) loop_f16(j->n, j->a, j->a | FMA_Z(1));
@@ -224,7 +227,7 @@ static void c_tp(int kind) {
     for (int t = 1; t <= 4; t *= 2) {
         pthread_t th[4]; struct job jobs[4];
         for (int i = 0; i < t; i++) {
-            jobs[i] = (struct job){kind, n, kind == 3 ? 0 : B62, 0, bufs[i], bufs[i] + 8192};
+            jobs[i] = (struct job){kind, n, kind == 3 ? 0 : B62, 0, bufs[i], bufs[i] + 8192, 0};
             pthread_create(&th[i], 0, worker, &jobs[i]);
         }
         double worst = 0;
@@ -234,9 +237,34 @@ static void c_tp(int kind) {
     }
 }
 
-int main(void) {
+// --- 6. the efficiency cores' AMX unit: the fp16 kernel step on threads at background QoS
+// (which macOS keeps on the E cores), alone and next to 4 user-interactive threads (P cores)
+static void c_ecores(int mode) {                         // mode: 0..2 = 1/2/4 E threads, 3 = 4 P + 4 E
+    int ne = mode == 0 ? 1 : mode == 1 ? 2 : 4, np = mode == 3 ? 4 : 0;
+    long n = 10000000;
+    pthread_t th[8]; struct job jobs[8];
+    for (int i = 0; i < np + ne; i++) {
+        jobs[i] = (struct job){2, n, B62, 0, bufs[i], bufs[i] + 8192, i < np ? 0x21 : 0x09};
+        pthread_create(&th[i], 0, worker, &jobs[i]);
+    }
+    double wp = 0, we = 0;
+    for (int i = 0; i < np + ne; i++) {
+        pthread_join(th[i], 0);
+        if (i < np) { if (jobs[i].secs > wp) wp = jobs[i].secs; } else if (jobs[i].secs > we) we = jobs[i].secs;
+    }
+    if (np) printf("ldx + ldy + fma16 fp32 sums: 4 P threads %6.0f GFLOP/s while 4 E threads %6.0f GFLOP/s\n",
+                   2.0 * 1024 * n * np / wp / 1e9, 2.0 * 1024 * n * ne / we / 1e9);
+    else printf("ldx + ldy + fma16 fp32 sums: %d E thread%s %6.0f GFLOP/s\n", ne, ne > 1 ? "s" : " ", 2.0 * 1024 * n * ne / we / 1e9);
+}
+
+int main(int argc, char** argv) {
     char cpu[128] = {0}; unsigned long len = sizeof cpu;
     if (sysctlbyname("machdep.cpu.brand_string", cpu, &len, 0, 0) == 0) printf("%s\n", cpu);
+    if (argc > 1 && strcmp(argv[1], "ecores") == 0) {
+        printf("== 6. efficiency-core AMX (background QoS)\n");
+        for (int m = 0; m < 4; m++) run(c_ecores, m);
+        return 0;
+    }
     for (int i = 0; i < 512; i++) src[i] = i;
     for (int l = 0; l < 16; l++) ones[l] = 1;
 
