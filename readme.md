@@ -12,10 +12,13 @@ These runs use Karpathy's real GPT-2 124M weights on Tiny Shakespeare (val split
 |---|---|---|---|---|
 | llm.c (fp32, OpenMP) | 176–199 · 1× | 403–405 · 1× | – | – |
 | **fp32** | 66 · **2.68×** | 183 · **2.20×** | +0.0001 | 1 of 32,000 |
-| **fp16** | 43 · **4.63×** | 104 · **3.88×** | +0.0004 | 2.8% |
-| **int8** (SmoothQuant) | 23 · **8.73×** | 56 · **7.20×** | +0.029 | 15.6% |
+| **fp16** | 38 · **4.78×** | 102 · **4.00×** | +0.0001 | 2.6% |
+| **int8** (SmoothQuant) | 21 · **8.90×** | 54 · **7.62×** | +0.022 | 15% |
 
-At 4 threads that's about 340 tokens/s for llm.c versus 970 (fp32), 1,500 (fp16) and 2,800 (int8) for the assembly. The 4-thread runs used 500 samples and the 1-thread runs 200, with llm.c's loss at 5.248 and 5.254 respectively.
+At 4 threads that's about 340 tokens/s for llm.c versus 1,090 (fp32), 1,670 (fp16) and 3,000 (int8) for the assembly.
+
+- **fp32:** 500 samples on 4 threads, 200 on 1.
+- **fp16 and int8:** 150 samples on 4 threads, 120 on 1, measured after the attention rewrite (step 12 in the log below).
 
 - **fp32** is numerically equivalent to llm.c, differing only by rounding (total variation distance ≤ 1e-4 per position). Generated text matches llm.c token for token until the random draw falls in the long tail of tiny probabilities. There, rounding-level differences can pick a neighbouring token, just as two builds of llm.c with different compiler flags would.
 - **fp16** is practically lossless.
@@ -77,6 +80,28 @@ These steps were measured with the real weights: 100 samples, 4 threads, Tiny Sh
 10. **SmoothQuant.** A one-time calibration pass on 1,024 training tokens records each input channel's maximum. Then channel k of the activations is divided by s_k, and the matching weight column is multiplied by s_k: `s_k = max|x_k|^α / max|W_k|^(1−α)`. The math is unchanged, but the outliers move into the weights, which have one scale per output channel.
 11. **α = 0.25** moves less into the weights. That works better for GPT-2, whose weights are already harder to quantize than OPT-style models.
 
+### Part 3: what's left besides the matmuls
+
+`GPT2A_PROFILE=1` prints a per-stage breakdown. It times each stage by reading the CPU's counter register (`cntvct_el0`) directly in assembly. On 1 thread with int8, the matmuls ran at about 90% of the `sdot` peak, and the other stages were about 17% of the time.
+
+These numbers use the real weights. Stage times are per forward pass of 64 tokens, measured without llm.c in the loop. The ×llm.c figures come from interleaved runs on 4 threads (150 samples) and 1 thread (120 samples).
+
+| # | Change | Effect |
+|---|---|---|
+| 12 | Attention for head size 64: query in 16 registers, 4 keys scored per pass, the 64-wide output kept in registers while summing over values. It replaces a dot-product call per query/key pair. | Attention 7.0 → 2.6 ms (1 thread), 1.6 → 0.6 ms (4 threads). int8 7.20× → **7.62×** (1 thread), 8.73× → **8.90×** (4 threads). fp16 3.88× → 4.00×, 4.63× → 4.78×. |
+| 13 | GELU as x / (1 + e^(−2u)) using a reciprocal estimate plus Newton steps, and softmax multiplying by 1/sum instead of dividing | No measurable change: GELU stays at 2.2 ms, limited by the `exp` polynomial rather than the division. Kept because it's simpler. |
+
+int8 on 1 thread now takes about 52 ms per forward pass, split as follows:
+
+| Stage | ms |
+|---|---|
+| Matmuls (qkv, attention projection, MLP, logits) | 43 |
+| Attention | 2.6 |
+| Softmax | 2.3 |
+| GELU | 2.2 |
+| Layernorm | 0.9 |
+| int8 input conversion | 0.8 |
+
 ## Reproduce
 
 ```sh
@@ -84,6 +109,7 @@ cd gpt2asm && ./run_bench.sh                    # downloads Karpathy's weights; 
 ./run_bench.sh 1000 1                           # single-threaded
 GPT2A_PRECISION=fp16 ./run_bench.sh 500         # fp16
 GPT2A_PRECISION=int8 ./run_bench.sh 500         # int8: calibrates on the train split, evaluates on val
+GPT2A_PROFILE=1 GPT2A_PRECISION=int8 ./run_bench.sh 100   # plus a per-stage time breakdown
 ```
 
 On macOS, llm.c needs `brew install libomp` to run multi-threaded.

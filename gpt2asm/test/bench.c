@@ -16,6 +16,7 @@ void gpt2a_alloc_acts(long, long);
 float* gpt2a_forward(const int*, long, long);
 void gpt2a_set_threads(long);
 long gpt2a_get_threads(void);
+void gpt2a_profile_print(void);
 
 static double now(void) {
     struct timespec ts;
@@ -115,6 +116,7 @@ int main(int argc, char** argv) {
     printf("%-22s %10.2f %12.2f %12.1f %10.4f\n", la, t_a, 1000 * t_a / N, ntoks / t_a, loss_a / ntoks);
     printf("assembly is %.2fx the speed of llm.c\n", t_c / t_a);
     printf("agreement: max |prob diff| %.2e, top-token mismatches %d of %.0f positions\n", maxdiff, top_mismatch, ntoks);
+    if (getenv("GPT2A_PROFILE")) gpt2a_profile_print();
     printf("RAW %d %d %.6f %.6f %.6f %.6f %.3e %d %d %ld\n", N, T, t_c, t_a, loss_c, loss_a, maxdiff, top_mismatch, c_threads, a_threads);
     return 0;
 }

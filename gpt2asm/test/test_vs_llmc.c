@@ -142,11 +142,11 @@ static void test_kernels(void) {
         check(nm, o2, o1, N*C, 1e-5);
     }
     // attention (hs=8 vector path, hs=6 scalar tail, hs=64 like GPT-2)
-    int at[][4] = {{2,5,24,3},{1,7,12,2},{1,9,128,2}};
-    for (int s = 0; s < 3; s++) {
+    int at[][4] = {{2,5,24,3},{1,7,12,2},{1,9,128,2},{2,37,192,3},{1,64,768,12},{1,1,64,1},{3,6,128,2}};
+    for (int s = 0; s < 7; s++) {
         int B = at[s][0], T = at[s][1], C = at[s][2], NH = at[s][3];
         float *qkv = rnd(B*T*3*C, 2), *o1 = zeros(B*T*C), *o2 = zeros(B*T*C);
-        float *pre = zeros(B*NH*T*T), *att = zeros(B*NH*T*T), *scr = zeros(T);
+        float *pre = zeros(B*NH*T*T), *att = zeros(B*NH*T*T), *scr = zeros(T + 8);
         attention_forward(o1, pre, att, qkv, B, T, C, NH);
         a_attention_forward(o2, qkv, scr, B, T, C, NH);
         char nm[64]; snprintf(nm, 64, "attention B=%d T=%d C=%d NH=%d", B, T, C, NH);

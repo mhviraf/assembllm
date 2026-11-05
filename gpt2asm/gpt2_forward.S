@@ -151,22 +151,23 @@
     add     \x\().4s, \x\().4s, \n\().4s
 .endm
 
-// v4 = x  ->  v0 = 0.5 x (1 + tanh(s (x + 0.044715 x^3))), tanh u = (e^2u - 1)/(e^2u + 1)
-// needs v16 = 0.044715, v17 = sqrt(2/pi), v18 = 0.5, exp constants. Uses v1-v3.
+// v4 = x  ->  v0 = 0.5 x (1 + tanh(u)) = x / (1 + e^(-2u)),  u = s (x + 0.044715 x^3)
+// The reciprocal is an estimate plus two Newton steps (no divide).
+// needs v16 = 0.044715, v17 = -2 sqrt(2/pi), exp constants. Uses v1-v3.
 .macro GELU4
     fmul    v1.4s, v16.4s, v4.4s
     fmul    v1.4s, v1.4s, v4.4s
     fmul    v1.4s, v1.4s, v4.4s
     fadd    v1.4s, v4.4s, v1.4s
-    fmul    v1.4s, v17.4s, v1.4s
-    fadd    v0.4s, v1.4s, v1.4s
+    fmul    v0.4s, v17.4s, v1.4s        // -2u
     VEXP    v0, v1, v2, v3
-    fsub    v1.4s, v0.4s, v31.4s
-    fadd    v0.4s, v0.4s, v31.4s
-    fdiv    v1.4s, v1.4s, v0.4s
-    fadd    v1.4s, v1.4s, v31.4s
-    fmul    v2.4s, v18.4s, v4.4s
-    fmul    v0.4s, v2.4s, v1.4s
+    fadd    v0.4s, v0.4s, v31.4s        // 1 + e^(-2u)
+    frecpe  v1.4s, v0.4s
+    frecps  v2.4s, v0.4s, v1.4s
+    fmul    v1.4s, v1.4s, v2.4s
+    frecps  v2.4s, v0.4s, v1.4s
+    fmul    v1.4s, v1.4s, v2.4s
+    fmul    v0.4s, v4.4s, v1.4s
 .endm
 
 // 5x16 kernel: one k of 5 rows (inputs v0-v4, lane i) times 16 channels (v5-v8)
@@ -374,11 +375,26 @@
 98:
 .endm
 
+// profiling: add the time since the last mark to slot, then mark (uses x9-x13)
+.macro PROFTICK base, slot
+    ldr     x9, [\base, #G_PROFON]
+    cbz     x9, 96f
+    mrs     x10, cntvct_el0
+    ldr     x11, [\base, #G_PROF_LAST]
+    sub     x12, x10, x11
+    ldr     x13, [\base, #(G_PROF + 8 * \slot)]
+    add     x13, x13, x12
+    str     x13, [\base, #(G_PROF + 8 * \slot)]
+    str     x10, [\base, #G_PROF_LAST]
+96:
+.endm
+
 // float constants (bit patterns)
 .equ F_NEG10000,   0xC61C4000      // -10000.0f, initial max in llm.c
 .equ F_EPS,        0x3727C5AC      // 1e-5f, layernorm epsilon
 .equ F_GELU_CUBE,  0x3D372713      // 0.044715f
 .equ F_GELU_SCALE, 0x3F4C4229      // sqrtf(2.0f / M_PI)
+.equ F_GELU_M2S,   0xBFCC4229      // -2 * sqrtf(2.0f / M_PI)
 .equ F_2POW24,     0x4B800000      // 16777216.0f
 
 .equ MODEL_MAGIC,  20240326
@@ -426,7 +442,12 @@
 .equ G_STATS,       2352     // per-layer [C | C | C | 4C] + final [C]: max |x| (then 1/s)
 .equ G_SCALES,      2360     // same layout: s (applied to the weights)
 .equ G_ALPHA,       2368     // SmoothQuant alpha x 100: 25 (default), 50 or 75
-.equ G_SIZE,        2432
+.equ G_PROFON,      2376     // 1 when GPT2A_PROFILE is set
+.equ G_PROF_LAST,   2384     // counter value at the last profiling mark
+.equ G_PROF_N,      2392     // forward passes profiled
+.equ G_PROF,        2400     // 12 per-stage tick totals
+.equ G_SIZE,        2496
+.equ NPROF,         12
 .equ KC16,          64       // fp16 accumulation block before folding into fp32
 .equ MAX_THREADS,   64
 
@@ -499,6 +520,23 @@ s_err_cap:       .asciz "Error: B*T is larger than the allocated activations\n"
 s_err_tok:       .asciz "Error: input token out of range [0, vocab_size)\n"
 s_warn_tok:      .asciz "WARNING: could not open tokenizer file %s, printing token ids instead\n"
 s_invalid_tok:   .asciz "invalid token id %ld!\n"
+s_prof_names:
+    .ascii "encoder        \0"
+    .ascii "layernorm      \0"
+    .ascii "qkv matmul     \0"
+    .ascii "attention      \0"
+    .ascii "attproj matmul \0"
+    .ascii "residual       \0"
+    .ascii "fc matmul      \0"
+    .ascii "gelu           \0"
+    .ascii "fcproj matmul  \0"
+    .ascii "logits matmul  \0"
+    .ascii "softmax        \0"
+    .ascii "input convert  \0"
+s_prof_fmt:      .asciz "  %s %8.3f ms\n"
+s_prof_head:     .asciz "per forward pass (assembly, averaged over %ld passes):\n"
+s_prof_total:    .asciz "  total           %8.3f ms\n"
+s_env_profile:   .asciz "GPT2A_PROFILE"
 s_env_threads:   .asciz "GPT2A_THREADS"
 s_env_prec:      .asciz "GPT2A_PRECISION"
 s_env_calib:     .asciz "GPT2A_CALIB"
@@ -988,13 +1026,15 @@ FUNC SYM(a_attention_forward)
 //                        long B, long T, long C, long NH, long h0 | (h1 << 32))
 // Attention for heads h0 .. h1-1 only (one thread's share).
 FUNC SYM(a_attention_heads)
-    stp     x29, x30, [sp, #-160]!
+    stp     x29, x30, [sp, #-208]!
     mov     x29, sp
     SAVE_X19_X28
     stp     d8, d9, [sp, #96]
     stp     d10, d11, [sp, #112]
-    // locals: [sp, #128] exp-loop pointer, [sp, #136] exp-loop end,
-    //         [sp, #144] first head offset, [sp, #152] end head offset
+    stp     d12, d13, [sp, #160]
+    stp     d14, d15, [sp, #176]
+    // locals: [sp, #144] first head offset, [sp, #152] end head offset,
+    //         [sp, #192] scale (fp32 bits); x16 = 1 for the head-size-64 fast path
     mov     x19, x0                     // out
     mov     x20, x1                     // qkv
     mov     x21, x2                     // scratch
@@ -1016,6 +1056,9 @@ FUNC SYM(a_attention_heads)
     fmov    d1, #1.0
     fdiv    d0, d1, d0
     fcvt    s8, d0
+    str     s8, [sp, #192]
+    cmp     x25, #64
+    cset    x16, eq                     // GPT-2: hs = 64 -> register-resident path
     mov     x26, #0                     // b*T
 att_b:
     cmp     x26, x24
@@ -1042,6 +1085,195 @@ att_h:
     add     x9, x9, x28
     add     x13, x20, x9, lsl #2        // key of position 0
     mov     x12, #0                     // t2
+    cbz     x16, 1f
+    // fast path (hs = 64): q * scale in v0-v15, scores of 4 keys per pass. Keys past t
+    // are clamped to key t (their scores are written past the row and never used).
+    ld1     {v0.4s, v1.4s, v2.4s, v3.4s}, [x15]
+    add     x9, x15, #64
+    ld1     {v4.4s, v5.4s, v6.4s, v7.4s}, [x9]
+    add     x9, x15, #128
+    ld1     {v8.4s, v9.4s, v10.4s, v11.4s}, [x9]
+    add     x9, x15, #192
+    ld1     {v12.4s, v13.4s, v14.4s, v15.4s}, [x9]
+    add     x9, sp, #192
+    ld1r    {v16.4s}, [x9]
+    fmul    v0.4s, v0.4s, v16.4s
+    fmul    v1.4s, v1.4s, v16.4s
+    fmul    v2.4s, v2.4s, v16.4s
+    fmul    v3.4s, v3.4s, v16.4s
+    fmul    v4.4s, v4.4s, v16.4s
+    fmul    v5.4s, v5.4s, v16.4s
+    fmul    v6.4s, v6.4s, v16.4s
+    fmul    v7.4s, v7.4s, v16.4s
+    fmul    v8.4s, v8.4s, v16.4s
+    fmul    v9.4s, v9.4s, v16.4s
+    fmul    v10.4s, v10.4s, v16.4s
+    fmul    v11.4s, v11.4s, v16.4s
+    fmul    v12.4s, v12.4s, v16.4s
+    fmul    v13.4s, v13.4s, v16.4s
+    fmul    v14.4s, v14.4s, v16.4s
+    fmul    v15.4s, v15.4s, v16.4s
+    FLOADK  s24, w9, F_NEG10000
+    dup     v24.4s, v24.s[0]
+    mov     x10, #0                     // first key of the group
+70: cmp     x10, x27
+    b.gt    71f
+    madd    x0, x10, x14, x13
+    add     x9, x10, #1
+    cmp     x9, x27
+    csel    x9, x27, x9, gt
+    madd    x1, x9, x14, x13
+    add     x9, x10, #2
+    cmp     x9, x27
+    csel    x9, x27, x9, gt
+    madd    x2, x9, x14, x13
+    add     x9, x10, #3
+    cmp     x9, x27
+    csel    x9, x27, x9, gt
+    madd    x3, x9, x14, x13
+    movi    v16.16b, #0
+    movi    v17.16b, #0
+    movi    v18.16b, #0
+    movi    v19.16b, #0
+    ld1     {v20.4s}, [x0], #16
+    ld1     {v21.4s}, [x1], #16
+    ld1     {v22.4s}, [x2], #16
+    ld1     {v23.4s}, [x3], #16
+    fmla    v16.4s, v20.4s, v0.4s
+    fmla    v17.4s, v21.4s, v0.4s
+    fmla    v18.4s, v22.4s, v0.4s
+    fmla    v19.4s, v23.4s, v0.4s
+    ld1     {v20.4s}, [x0], #16
+    ld1     {v21.4s}, [x1], #16
+    ld1     {v22.4s}, [x2], #16
+    ld1     {v23.4s}, [x3], #16
+    fmla    v16.4s, v20.4s, v1.4s
+    fmla    v17.4s, v21.4s, v1.4s
+    fmla    v18.4s, v22.4s, v1.4s
+    fmla    v19.4s, v23.4s, v1.4s
+    ld1     {v20.4s}, [x0], #16
+    ld1     {v21.4s}, [x1], #16
+    ld1     {v22.4s}, [x2], #16
+    ld1     {v23.4s}, [x3], #16
+    fmla    v16.4s, v20.4s, v2.4s
+    fmla    v17.4s, v21.4s, v2.4s
+    fmla    v18.4s, v22.4s, v2.4s
+    fmla    v19.4s, v23.4s, v2.4s
+    ld1     {v20.4s}, [x0], #16
+    ld1     {v21.4s}, [x1], #16
+    ld1     {v22.4s}, [x2], #16
+    ld1     {v23.4s}, [x3], #16
+    fmla    v16.4s, v20.4s, v3.4s
+    fmla    v17.4s, v21.4s, v3.4s
+    fmla    v18.4s, v22.4s, v3.4s
+    fmla    v19.4s, v23.4s, v3.4s
+    ld1     {v20.4s}, [x0], #16
+    ld1     {v21.4s}, [x1], #16
+    ld1     {v22.4s}, [x2], #16
+    ld1     {v23.4s}, [x3], #16
+    fmla    v16.4s, v20.4s, v4.4s
+    fmla    v17.4s, v21.4s, v4.4s
+    fmla    v18.4s, v22.4s, v4.4s
+    fmla    v19.4s, v23.4s, v4.4s
+    ld1     {v20.4s}, [x0], #16
+    ld1     {v21.4s}, [x1], #16
+    ld1     {v22.4s}, [x2], #16
+    ld1     {v23.4s}, [x3], #16
+    fmla    v16.4s, v20.4s, v5.4s
+    fmla    v17.4s, v21.4s, v5.4s
+    fmla    v18.4s, v22.4s, v5.4s
+    fmla    v19.4s, v23.4s, v5.4s
+    ld1     {v20.4s}, [x0], #16
+    ld1     {v21.4s}, [x1], #16
+    ld1     {v22.4s}, [x2], #16
+    ld1     {v23.4s}, [x3], #16
+    fmla    v16.4s, v20.4s, v6.4s
+    fmla    v17.4s, v21.4s, v6.4s
+    fmla    v18.4s, v22.4s, v6.4s
+    fmla    v19.4s, v23.4s, v6.4s
+    ld1     {v20.4s}, [x0], #16
+    ld1     {v21.4s}, [x1], #16
+    ld1     {v22.4s}, [x2], #16
+    ld1     {v23.4s}, [x3], #16
+    fmla    v16.4s, v20.4s, v7.4s
+    fmla    v17.4s, v21.4s, v7.4s
+    fmla    v18.4s, v22.4s, v7.4s
+    fmla    v19.4s, v23.4s, v7.4s
+    ld1     {v20.4s}, [x0], #16
+    ld1     {v21.4s}, [x1], #16
+    ld1     {v22.4s}, [x2], #16
+    ld1     {v23.4s}, [x3], #16
+    fmla    v16.4s, v20.4s, v8.4s
+    fmla    v17.4s, v21.4s, v8.4s
+    fmla    v18.4s, v22.4s, v8.4s
+    fmla    v19.4s, v23.4s, v8.4s
+    ld1     {v20.4s}, [x0], #16
+    ld1     {v21.4s}, [x1], #16
+    ld1     {v22.4s}, [x2], #16
+    ld1     {v23.4s}, [x3], #16
+    fmla    v16.4s, v20.4s, v9.4s
+    fmla    v17.4s, v21.4s, v9.4s
+    fmla    v18.4s, v22.4s, v9.4s
+    fmla    v19.4s, v23.4s, v9.4s
+    ld1     {v20.4s}, [x0], #16
+    ld1     {v21.4s}, [x1], #16
+    ld1     {v22.4s}, [x2], #16
+    ld1     {v23.4s}, [x3], #16
+    fmla    v16.4s, v20.4s, v10.4s
+    fmla    v17.4s, v21.4s, v10.4s
+    fmla    v18.4s, v22.4s, v10.4s
+    fmla    v19.4s, v23.4s, v10.4s
+    ld1     {v20.4s}, [x0], #16
+    ld1     {v21.4s}, [x1], #16
+    ld1     {v22.4s}, [x2], #16
+    ld1     {v23.4s}, [x3], #16
+    fmla    v16.4s, v20.4s, v11.4s
+    fmla    v17.4s, v21.4s, v11.4s
+    fmla    v18.4s, v22.4s, v11.4s
+    fmla    v19.4s, v23.4s, v11.4s
+    ld1     {v20.4s}, [x0], #16
+    ld1     {v21.4s}, [x1], #16
+    ld1     {v22.4s}, [x2], #16
+    ld1     {v23.4s}, [x3], #16
+    fmla    v16.4s, v20.4s, v12.4s
+    fmla    v17.4s, v21.4s, v12.4s
+    fmla    v18.4s, v22.4s, v12.4s
+    fmla    v19.4s, v23.4s, v12.4s
+    ld1     {v20.4s}, [x0], #16
+    ld1     {v21.4s}, [x1], #16
+    ld1     {v22.4s}, [x2], #16
+    ld1     {v23.4s}, [x3], #16
+    fmla    v16.4s, v20.4s, v13.4s
+    fmla    v17.4s, v21.4s, v13.4s
+    fmla    v18.4s, v22.4s, v13.4s
+    fmla    v19.4s, v23.4s, v13.4s
+    ld1     {v20.4s}, [x0], #16
+    ld1     {v21.4s}, [x1], #16
+    ld1     {v22.4s}, [x2], #16
+    ld1     {v23.4s}, [x3], #16
+    fmla    v16.4s, v20.4s, v14.4s
+    fmla    v17.4s, v21.4s, v14.4s
+    fmla    v18.4s, v22.4s, v14.4s
+    fmla    v19.4s, v23.4s, v14.4s
+    ld1     {v20.4s}, [x0], #16
+    ld1     {v21.4s}, [x1], #16
+    ld1     {v22.4s}, [x2], #16
+    ld1     {v23.4s}, [x3], #16
+    fmla    v16.4s, v20.4s, v15.4s
+    fmla    v17.4s, v21.4s, v15.4s
+    fmla    v18.4s, v22.4s, v15.4s
+    fmla    v19.4s, v23.4s, v15.4s
+    faddp   v16.4s, v16.4s, v17.4s
+    faddp   v18.4s, v18.4s, v19.4s
+    faddp   v16.4s, v16.4s, v18.4s      // 4 scores
+    add     x9, x21, x10, lsl #2
+    st1     {v16.4s}, [x9]
+    fmax    v24.4s, v24.4s, v16.4s
+    add     x10, x10, #4
+    b       70b
+71: fmaxv   s9, v24.4s                  // max
+    VEXP_CONSTS
+    b       2f
 1:  cmp     x12, x27
     b.gt    2f
     mov     x9, x15
@@ -1111,6 +1343,7 @@ att_h:
     add     x10, x19, x9, lsl #2        // output slice
     mov     x11, x10
     mov     x12, x25
+    cbnz    x16, 8f                     // fast path does not need the zeroing
 7:  cbz     x12, 8f
     str     wzr, [x11], #4
     sub     x12, x12, #1
@@ -1121,7 +1354,64 @@ att_h:
     add     x9, x9, x23, lsl #1         // + 2C
     add     x9, x9, x28
     add     x13, x20, x9, lsl #2        // value of position 0
-    mov     x12, #0                     // t2
+    cbz     x16, 79f
+    // fast path: the 64-wide output lives in v0-v15 while summing over the values
+    movi    v0.16b, #0
+    movi    v1.16b, #0
+    movi    v2.16b, #0
+    movi    v3.16b, #0
+    movi    v4.16b, #0
+    movi    v5.16b, #0
+    movi    v6.16b, #0
+    movi    v7.16b, #0
+    movi    v8.16b, #0
+    movi    v9.16b, #0
+    movi    v10.16b, #0
+    movi    v11.16b, #0
+    movi    v12.16b, #0
+    movi    v13.16b, #0
+    movi    v14.16b, #0
+    movi    v15.16b, #0
+    mov     x12, #0
+80: cmp     x12, x27
+    b.gt    81f
+    add     x9, x21, x12, lsl #2
+    ld1r    {v16.4s}, [x9]              // att[t2]
+    mov     x9, x13
+    ld1     {v17.4s, v18.4s, v19.4s, v20.4s}, [x9], #64
+    ld1     {v21.4s, v22.4s, v23.4s, v24.4s}, [x9]
+    fmla    v0.4s, v17.4s, v16.4s
+    fmla    v1.4s, v18.4s, v16.4s
+    fmla    v2.4s, v19.4s, v16.4s
+    fmla    v3.4s, v20.4s, v16.4s
+    fmla    v4.4s, v21.4s, v16.4s
+    fmla    v5.4s, v22.4s, v16.4s
+    fmla    v6.4s, v23.4s, v16.4s
+    fmla    v7.4s, v24.4s, v16.4s
+    add     x9, x13, #128
+    ld1     {v17.4s, v18.4s, v19.4s, v20.4s}, [x9], #64
+    ld1     {v21.4s, v22.4s, v23.4s, v24.4s}, [x9]
+    fmla    v8.4s, v17.4s, v16.4s
+    fmla    v9.4s, v18.4s, v16.4s
+    fmla    v10.4s, v19.4s, v16.4s
+    fmla    v11.4s, v20.4s, v16.4s
+    fmla    v12.4s, v21.4s, v16.4s
+    fmla    v13.4s, v22.4s, v16.4s
+    fmla    v14.4s, v23.4s, v16.4s
+    fmla    v15.4s, v24.4s, v16.4s
+    add     x13, x13, x14
+    add     x12, x12, #1
+    b       80b
+81:
+    st1     {v0.4s, v1.4s, v2.4s, v3.4s}, [x10]
+    add     x9, x10, #64
+    st1     {v4.4s, v5.4s, v6.4s, v7.4s}, [x9]
+    add     x9, x10, #128
+    st1     {v8.4s, v9.4s, v10.4s, v11.4s}, [x9]
+    add     x9, x10, #192
+    st1     {v12.4s, v13.4s, v14.4s, v15.4s}, [x9]
+    b       13f
+79: mov     x12, #0                     // t2
 9:  cmp     x12, x27
     b.gt    13f
     ldr     s1, [x21, x12, lsl #2]
@@ -1158,19 +1448,21 @@ att_b_next:
 att_done:
     ldp     d8, d9, [sp, #96]
     ldp     d10, d11, [sp, #112]
+    ldp     d12, d13, [sp, #160]
+    ldp     d14, d15, [sp, #176]
     RESTORE_X19_X28
-    ldp     x29, x30, [sp], #160
+    ldp     x29, x30, [sp], #208
     ret
 
 // void a_gelu_forward(float* out, const float* inp, long N)    (tanh GELU)
-// out = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))), 4 at a time
+// out = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))), 4 at a time,
+// computed as x / (1 + exp(-2 * sqrt(2/pi) * (x + 0.044715 * x^3)))
 FUNC SYM(a_gelu_forward)
     VEXP_CONSTS
     FLOADK  s16, w9, F_GELU_CUBE
     dup     v16.4s, v16.s[0]
-    FLOADK  s17, w9, F_GELU_SCALE
+    FLOADK  s17, w9, F_GELU_M2S
     dup     v17.4s, v17.s[0]
-    fmov    v18.4s, #0.5
 1:  cmp     x2, #4
     b.lt    2f
     ld1     {v4.4s}, [x1], #16
@@ -1269,19 +1561,31 @@ sm_row:
 7:  faddp   v18.4s, v18.4s, v18.4s
     faddp   s18, v18.2s
     fadd    s18, s18, s19               // sum
+    fmov    s1, #1.0
+    fdiv    s18, s1, s18                // 1 / sum
     dup     v1.4s, v18.s[0]
     mov     x12, x11
     mov     x13, x3
-8:  cmp     x13, #4
+8:  cmp     x13, #16
+    b.lt    81f
+    ld1     {v2.4s, v3.4s, v4.4s, v5.4s}, [x12]
+    fmul    v2.4s, v2.4s, v1.4s
+    fmul    v3.4s, v3.4s, v1.4s
+    fmul    v4.4s, v4.4s, v1.4s
+    fmul    v5.4s, v5.4s, v1.4s
+    st1     {v2.4s, v3.4s, v4.4s, v5.4s}, [x12], #64
+    sub     x13, x13, #16
+    b       8b
+81: cmp     x13, #4
     b.lt    9f
     ld1     {v0.4s}, [x12]
-    fdiv    v0.4s, v0.4s, v1.4s
+    fmul    v0.4s, v0.4s, v1.4s
     st1     {v0.4s}, [x12], #16
     sub     x13, x13, #4
-    b       8b
+    b       81b
 9:  cbz     x13, 10f
     ldr     s0, [x12]
-    fdiv    s0, s0, s18
+    fmul    s0, s0, s18
     str     s0, [x12], #4
     sub     x13, x13, #1
     b       9b
@@ -2550,6 +2854,13 @@ calibrate:
     mov     x4, x25
     bl      smooth_one
     str     xzr, [x20, #G_ACT_CAP]      // the caller allocates its own activations
+    str     xzr, [x20, #G_PROF_N]       // calibration passes do not count in the profile
+    add     x9, x20, #G_PROF
+    mov     x10, #0
+10: str     xzr, [x9, x10, lsl #3]
+    add     x10, x10, #1
+    cmp     x10, #NPROF
+    b.lt    10b
     RESTORE_X19_X28
     ldp     x29, x30, [sp], #96
     ret
@@ -2698,6 +3009,11 @@ FUNC SYM(gpt2a_build_from_checkpoint)
     b.lt    7b
     mov     x0, x21
     bl      SYM(fclose)
+    LOADADDR x0, s_env_profile
+    bl      SYM(getenv)
+    cmp     x0, #0
+    cset    x9, ne
+    str     x9, [x20, #G_PROFON]
     // repack matmul weights: fp16 5x32 kernel if asked for and C, Vp % 32 == 0,
     // else fp32 5x16 kernel if C, Vp % 16 == 0, else leave them as they are
     ldr     x9, [x20, #G_C]
@@ -2770,7 +3086,8 @@ FUNC SYM(gpt2a_alloc_acts)
     bl      xmalloc
     str     x0, [x19, #G_ACT_PROBS]
     ldr     x0, [x19, #G_MAXT]
-    lsl     x0, x0, #8                  // maxT floats for each of 64 threads
+    add     x0, x0, #8
+    lsl     x0, x0, #8                  // maxT + 8 floats for each of 64 threads
     bl      xmalloc
     str     x0, [x19, #G_ACT_SCRATCH]
     lsl     x0, x21, #3                 // 4*N*C halves
@@ -2832,7 +3149,14 @@ FUNC SYM(gpt2a_forward)
     b       die
 7:  bl      threads_init
     bl      pool_start
-    ldr     x23, [x28, #G_C]            // C
+    ldr     x9, [x28, #G_PROFON]
+    cbz     x9, 9f
+    ldr     x10, [x28, #G_PROF_N]
+    add     x10, x10, #1
+    str     x10, [x28, #G_PROF_N]
+    mrs     x10, cntvct_el0
+    str     x10, [x28, #G_PROF_LAST]
+9:  ldr     x23, [x28, #G_C]            // C
     add     x27, x23, x23, lsl #1
     add     x27, x27, x23, lsl #2       // 7C: per-layer stats stride
     // token + position embeddings
@@ -2844,6 +3168,7 @@ FUNC SYM(gpt2a_forward)
     mov     x5, x21
     mov     x6, x23
     bl      SYM(a_encoder_forward)
+    PROFTICK x28, 0
     mov     x24, #0                     // layer l
 fwd_layer:
     ldr     x9, [x28, #G_L]
@@ -2860,6 +3185,7 @@ fwd_layer:
     mov     x4, x22
     mov     x5, x23
     bl      playernorm
+    PROFTICK x28, 1
     // qkv = ln1 @ qkvw^T + qkvb
     add     x26, x23, x23, lsl #1       // 3C
     mul     x9, x25, x26
@@ -2876,6 +3202,7 @@ fwd_layer:
     mul     x13, x24, x27
     MMHOOK  x1, x22, x23, x13
     bl      pmatmul
+    PROFTICK x28, 2
     // attention
     ldr     x0, [x28, #G_ACT_ATTY]
     ldr     x1, [x28, #G_ACT_QKV]
@@ -2885,6 +3212,7 @@ fwd_layer:
     mov     x5, x23
     ldr     x6, [x28, #G_NH]
     bl      pattention
+    PROFTICK x28, 3
     // attention projection
     mul     x9, x25, x23
     ldr     x0, [x28, #G_ACT_PROJ]
@@ -2900,12 +3228,14 @@ fwd_layer:
     add     x13, x13, x23
     MMHOOK  x1, x22, x23, x13
     bl      pmatmul
+    PROFTICK x28, 4
     // residual
     ldr     x0, [x28, #G_ACT_X]
     mov     x1, x0
     ldr     x2, [x28, #G_ACT_PROJ]
     mul     x3, x22, x23
     bl      presidual
+    PROFTICK x28, 5
     // ln2
     ldr     x0, [x28, #G_ACT_LN]
     ldr     x1, [x28, #G_ACT_X]
@@ -2916,6 +3246,7 @@ fwd_layer:
     mov     x4, x22
     mov     x5, x23
     bl      playernorm
+    PROFTICK x28, 1
     // MLP up: fch = ln2 @ fcw^T + fcb
     lsl     x26, x23, #2                // 4C
     mul     x9, x25, x26
@@ -2933,11 +3264,13 @@ fwd_layer:
     add     x13, x13, x23, lsl #1
     MMHOOK  x1, x22, x23, x13
     bl      pmatmul
+    PROFTICK x28, 6
     // gelu, in place
     ldr     x0, [x28, #G_ACT_FCH]
     mov     x1, x0
     mul     x2, x22, x26
     bl      pgelu
+    PROFTICK x28, 7
     // MLP down
     mul     x9, x25, x26
     ldr     x0, [x28, #G_ACT_PROJ]
@@ -2954,12 +3287,14 @@ fwd_layer:
     add     x13, x13, x23
     MMHOOK  x1, x22, x26, x13
     bl      pmatmul
+    PROFTICK x28, 8
     // residual
     ldr     x0, [x28, #G_ACT_X]
     mov     x1, x0
     ldr     x2, [x28, #G_ACT_PROJ]
     mul     x3, x22, x23
     bl      presidual
+    PROFTICK x28, 5
     add     x24, x24, #1
     b       fwd_layer
 fwd_final:
@@ -2971,6 +3306,7 @@ fwd_final:
     mov     x4, x22
     mov     x5, x23
     bl      playernorm
+    PROFTICK x28, 1
     // logits = lnf @ wte^T (weights tied, no bias), into the probs buffer
     ldr     x0, [x28, #G_ACT_PROBS]
     ldr     x1, [x28, #G_ACT_LN]
@@ -2985,6 +3321,7 @@ fwd_final:
     mul     x13, x9, x27
     MMHOOK  x1, x22, x23, x13
     bl      pmatmul
+    PROFTICK x28, 9
     // softmax, in place
     ldr     x0, [x28, #G_ACT_PROBS]
     mov     x1, x0
@@ -2992,6 +3329,7 @@ fwd_final:
     ldr     x3, [x28, #G_V]
     ldr     x4, [x28, #G_VP]
     bl      psoftmax
+    PROFTICK x28, 10
     bl      pool_stop
     ldr     x0, [x28, #G_ACT_PROBS]
     RESTORE_X19_X28
@@ -3212,6 +3550,8 @@ pmatmul:                                // (out, inp, weight, bias, N, C, OC)
     ldr     x0, [x9, #G_ACT_H16]
     mul     x2, x4, x5
     bl      pconv16
+    LOADADDR x14, G
+    PROFTICK x14, 11
     ldp     x0, x1, [sp, #16]
     ldp     x2, x3, [sp, #32]
     ldp     x4, x5, [sp, #48]
@@ -3233,6 +3573,8 @@ pmatmul:                                // (out, inp, weight, bias, N, C, OC)
     ldr     x0, [x9, #G_ACT_Q8]
     ldr     x1, [x9, #G_ACT_XS]
     bl      pquant
+    LOADADDR x14, G
+    PROFTICK x14, 11
     ldp     x0, x1, [sp, #16]
     ldp     x2, x3, [sp, #32]
     ldp     x4, x5, [sp, #48]
@@ -3322,6 +3664,7 @@ par_attention:
     LOADADDR x9, G
     ldr     x10, [x9, #G_NTHREADS]
     ldr     x8, [x9, #G_MAXT]
+    add     x8, x8, #8                  // scratch row stride
     add     x15, x9, #G_TASK
     ldr     x6, [x15, #48]              // NH
     add     x12, x6, x10
@@ -3509,6 +3852,61 @@ par_layernorm:                          // rows of (out, inp, w, b, N, C)
     mov     x4, x14
     b       SYM(a_layernorm_forward)
 99: ret
+
+// void gpt2a_profile_print(void): per-stage ms per forward pass (GPT2A_PROFILE=1)
+FUNC SYM(gpt2a_profile_print)
+    stp     x29, x30, [sp, #-64]!
+    mov     x29, sp
+    stp     x19, x20, [sp, #16]
+    stp     x21, x22, [sp, #32]
+    stp     d8, d9, [sp, #48]
+    LOADADDR x19, G
+    ldr     x20, [x19, #G_PROF_N]
+    cbz     x20, 9f
+    LOADADDR x0, s_prof_head
+    mov     x1, x20
+    bl      pr1
+    mrs     x9, cntfrq_el0
+    ucvtf   d8, x9
+    ucvtf   d0, x20
+    fmul    d8, d8, d0                  // ticks per second x passes
+    movi    d9, #0
+    mov     x21, #0
+1:  add     x9, x19, #G_PROF
+    ldr     x9, [x9, x21, lsl #3]
+    ucvtf   d0, x9
+    MOV32   w9, 1000
+    scvtf   d1, w9
+    fmul    d0, d0, d1
+    fdiv    d0, d0, d8                  // ms per pass
+    fadd    d9, d9, d0
+    LOADADDR x0, s_prof_fmt
+    LOADADDR x1, s_prof_names
+    add     x1, x1, x21, lsl #4
+    bl      pr1f
+    add     x21, x21, #1
+    cmp     x21, #NPROF
+    b.lt    1b
+    LOADADDR x0, s_prof_total
+    fmov    d0, d9
+    bl      prf
+9:  ldp     d8, d9, [sp, #48]
+    ldp     x19, x20, [sp, #16]
+    ldp     x21, x22, [sp, #32]
+    ldp     x29, x30, [sp], #64
+    ret
+
+// printf with one double: x0 = format, d0
+    .p2align 4
+prf:
+    stp     x29, x30, [sp, #-16]!
+    mov     x29, sp
+    sub     sp, sp, #16
+    str     d0, [sp]
+    bl      SYM(printf)
+    mov     sp, x29
+    ldp     x29, x30, [sp], #16
+    ret
 
 // ===========================================================================
 // sampler (llm.c: xorshift64* rng, sample from the cumulative distribution)
